@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Project specific
+logs/
+uploads/
+outputs/
+temp/
+*.mp4
+*.mp3
+*.srt
+
+# System
+.DS_Store
+.cursor/
+.agent/

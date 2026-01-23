@@ -1,0 +1,17 @@
+# SubtitleAI - Video Subtitle Generator Dependencies
+
+# Web Framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# AI Services
+openai          # Whisper transcription & GPT translation
+ollama          # Local open-source translation (optional)
+
+# Environment
+python-dotenv
+
+# RTL Support
+python-bidi
+arabic-reshaper
