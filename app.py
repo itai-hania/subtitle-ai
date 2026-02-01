@@ -69,20 +69,28 @@ def batch_translate_openai(texts: list, target_language: str, chunk_num: int = 0
     numbered_text = "\n".join([f"[{i+1}] {text}" for i, text in enumerate(texts)])
     
     response = openai_client.chat.completions.create(
-        model="gpt-5-nano",
+        model="gpt-5-mini",
         reasoning_effort="low",
         max_completion_tokens=10000,
         messages=[
             {
                 "role": "system",
-                "content": f"""You are a professional subtitle translator. Translate each numbered line to {target_language}.
+                "content": f"""You are an expert Hebrew subtitle translator with deep knowledge of both English and Hebrew idioms, grammar, and natural speech patterns. Translate each numbered line to {target_language}.
 
 CRITICAL RULES:
 1. Keep the EXACT same numbering format: [1], [2], [3], etc.
 2. Each translation MUST start with its number in brackets on its own line
-3. Translate EVERY word - do not leave any English
-4. Keep the same meaning and tone
-5. Output ONLY the numbered translations, nothing else
+3. Translate EVERY word - do not leave ANY English words
+4. Output ONLY the numbered translations, nothing else
+
+HEBREW TRANSLATION QUALITY RULES:
+5. Use NATURAL Hebrew expressions - never translate word-by-word literally
+6. Match proper Hebrew grammar: correct gender (זכר/נקבה), verb conjugation, and tense
+7. Use common everyday Hebrew vocabulary that native speakers actually use
+8. Preserve the original tone: casual speech stays casual, formal stays formal
+9. Translate idioms to their Hebrew equivalents, not literally (e.g., "break a leg" → "בהצלחה")
+10. Keep sentences concise - subtitles should be easy to read quickly
+11. For technical terms with no Hebrew equivalent, transliterate appropriately
 
 Example format:
 [1] תרגום ראשון
