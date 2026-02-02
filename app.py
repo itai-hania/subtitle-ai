@@ -31,6 +31,19 @@ OUTPUT_DIR = Path("outputs")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# Watermark configuration
+WATERMARK_CONFIG = {
+    "logo_path": Path("logo.jpg"),
+    "english_text": "@FinancialEduX",
+    "hebrew_text": "המחנך הפיננסי",
+    "opacity": 0.7,
+    "logo_height": 50,
+    "english_font_size": 16,
+    "hebrew_font_size": 18,
+    "margin": 15,
+    "text_spacing": 22,
+}
+
 # Store job status
 jobs = {}
 
@@ -357,29 +370,70 @@ def extract_audio(video_path: str, audio_path: str):
 
 
 def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_language: str):
-    """Embed subtitles into video using FFmpeg"""
-    # Standard font settings
+    """Embed subtitles and watermark into video using FFmpeg"""
     style = "FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1"
     
-    # Escape special characters in path for FFmpeg filter
-    # FFmpeg requires escaping: \ : ' for the subtitles filter
     srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "'\\''")
     
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", video_path,
-        "-vf", f"subtitles='{srt_escaped}':force_style='{style}'",
-        # Video settings: Preserve original timestamps and framerate
-        "-c:v", "libx264", 
-        "-preset", "fast",
-        "-vsync", "passthrough",  # Preserve original timestamps exactly
-        # Audio settings: Copy audio to maintain perfect sync
-        "-c:a", "copy",
-        # Output settings
-        "-movflags", "+faststart",
-        output_path
-    ]
+    wm = WATERMARK_CONFIG
+    logo_path = wm["logo_path"]
+    
+    if logo_path.exists():
+        logo_escaped = str(logo_path.absolute()).replace("\\", "/").replace(":", "\\:")
+        opacity = wm["opacity"]
+        logo_h = wm["logo_height"]
+        margin = wm["margin"]
+        eng_size = wm["english_font_size"]
+        heb_size = wm["hebrew_font_size"]
+        spacing = wm["text_spacing"]
+        eng_text = wm["english_text"]
+        heb_text = wm["hebrew_text"][::-1]  # Reverse for FFmpeg RTL fix
+        
+        hebrew_font = "/Library/Fonts/Arial Unicode.ttf"
+        hebrew_font_escaped = hebrew_font.replace(":", "\\\\:")
+        
+        filter_complex = (
+            f"[0:v]subtitles='{srt_escaped}':force_style='{style}'[sub];"
+            f"[1:v]scale=-1:{logo_h},format=rgba,colorchannelmixer=aa={opacity}[logo];"
+            f"[sub]drawtext=text='{eng_text}':"
+            f"fontsize={eng_size}:fontcolor=white@{opacity}:"
+            f"x={logo_h}+{margin*2}:y={margin}:"
+            f"shadowcolor=black:shadowx=1:shadowy=1[text1];"
+            f"[text1]drawtext=text='{heb_text}':"
+            f"fontfile='{hebrew_font_escaped}':"
+            f"fontsize={heb_size}:fontcolor=white@{opacity}:"
+            f"x={logo_h}+{margin*2}:y={margin + spacing}:"
+            f"shadowcolor=black:shadowx=1:shadowy=1[text2];"
+            f"[text2][logo]overlay={margin}:{margin}[out]"
+        )
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", str(logo_path.absolute()),
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+            "-map", "0:a",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            output_path
+        ]
+    else:
+        print(f"Warning: Logo not found at {logo_path}, watermark disabled")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-vf", f"subtitles='{srt_escaped}':force_style='{style}'",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-vsync", "passthrough",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            output_path
+        ]
+    
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except subprocess.CalledProcessError as e:
