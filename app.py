@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import re
 import threading
+import platform
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
@@ -546,10 +547,41 @@ def extract_audio(video_path: str, audio_path: str):
         raise Exception(parse_ffmpeg_error(e.stderr.decode() if e.stderr else ""))
 
 
+def get_hebrew_font_path() -> str:
+    """Get the path to a Hebrew-compatible font based on the current OS."""
+    system = platform.system()
+    if system == "Darwin":
+        candidates = [
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ]
+    elif system == "Windows":
+        windir = os.environ.get("WINDIR", r"C:\Windows")
+        candidates = [
+            os.path.join(windir, "Fonts", "arialuni.ttf"),
+            os.path.join(windir, "Fonts", "arial.ttf"),
+            os.path.join(windir, "Fonts", "segoeui.ttf"),
+        ]
+    else:  # Linux
+        candidates = [
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    print(f"Warning: No Hebrew-compatible font found for {system}, tried: {candidates}")
+    return candidates[0]
+
+
 def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_language: str):
     """Embed subtitles and watermark into video using FFmpeg"""
+    hebrew_font = get_hebrew_font_path()
+    fonts_dir = os.path.dirname(hebrew_font)
+    fonts_dir_escaped = fonts_dir.replace("\\", "/").replace(":", "\\:")
     style = "FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H40000000,BackColour=&H80000000,Outline=1,Shadow=2,Bold=0,MarginV=30"
-    
+
     srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "'\\''")
     
     wm = WATERMARK_CONFIG
@@ -565,12 +597,11 @@ def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_lan
         spacing = wm["text_spacing"]
         eng_text = wm["english_text"]
         heb_text = wm["hebrew_text"][::-1]  # Reverse for FFmpeg RTL fix
-        
-        hebrew_font = "/Library/Fonts/Arial Unicode.ttf"
-        hebrew_font_escaped = hebrew_font.replace(":", "\\\\:")
+
+        hebrew_font_escaped = hebrew_font.replace("\\", "/").replace(":", "\\\\:")
         
         filter_complex = (
-            f"[0:v]subtitles='{srt_escaped}':force_style='{style}'[sub];"
+            f"[0:v]subtitles='{srt_escaped}':fontsdir='{fonts_dir_escaped}':force_style='{style}'[sub];"
             f"[1:v]scale=-1:{logo_h},format=rgba,colorchannelmixer=aa={opacity}[logo];"
             f"[sub]drawtext=text='{eng_text}':"
             f"fontsize={eng_size}:fontcolor=white@{opacity}:"
@@ -602,7 +633,7 @@ def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_lan
         cmd = [
             "ffmpeg", "-y",
             "-i", video_path,
-            "-vf", f"subtitles='{srt_escaped}':force_style='{style}'",
+            "-vf", f"subtitles='{srt_escaped}':fontsdir='{fonts_dir_escaped}':force_style='{style}'",
             "-c:v", "libx264",
             "-preset", "fast",
             "-vsync", "passthrough",
