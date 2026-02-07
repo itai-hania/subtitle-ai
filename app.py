@@ -610,6 +610,87 @@ async def upload_video(
     return {"job_id": job_id, "message": "Video uploaded successfully. Processing started."}
 
 
+@app.post("/upload-only")
+async def upload_video_only(
+    video: UploadFile = File(...)
+):
+    """Upload video without starting processing (for wizard flow)."""
+    
+    if not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file.")
+    
+    job_id = str(uuid.uuid4())[:8]
+    
+    video_path = UPLOAD_DIR / f"{job_id}_{video.filename}"
+    with open(video_path, "wb") as f:
+        content = await video.read()
+        f.write(content)
+    
+    jobs[job_id] = {
+        "status": "uploaded",
+        "progress": 0,
+        "output_file": None,
+        "error": None,
+        "original_filename": video.filename,
+        "video_path": str(video_path),
+        "source_type": "upload"
+    }
+    
+    return {"job_id": job_id, "message": "Video uploaded successfully."}
+
+
+class ProcessRequest(BaseModel):
+    language: str = "English"
+    translation_service: str = "openai"
+    ollama_model: str = "llama3.2"
+
+
+@app.post("/process/{job_id}")
+async def process_existing_video(
+    job_id: str,
+    request: ProcessRequest,
+    background_tasks: BackgroundTasks
+):
+    """Start translation processing on an already downloaded/uploaded video."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    video_path = job.get("video_path")
+    
+    # Also check for uploaded files
+    if not video_path:
+        for ext in ['mp4', 'mov', 'avi', 'mkv']:
+            for file in UPLOAD_DIR.iterdir():
+                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
+                    video_path = str(file)
+                    break
+    
+    if not video_path or not Path(video_path).exists():
+        raise HTTPException(status_code=404, detail="Video file not found. Upload or download a video first.")
+    
+    # Update job for processing
+    job["status"] = "queued"
+    job["progress"] = 0
+    job["output_file"] = None
+    job["error"] = None
+    job["language"] = request.language
+    job["original_filename"] = job.get("original_filename", Path(video_path).name)
+    
+    # Start processing in background
+    use_ollama = request.translation_service.lower() == "ollama"
+    background_tasks.add_task(
+        process_video,
+        job_id,
+        video_path,
+        request.language,
+        use_ollama,
+        request.ollama_model
+    )
+    
+    return {"job_id": job_id, "message": "Processing started."}
+
+
 @app.get("/status/{job_id}")
 async def get_status(job_id: str):
     """Get processing status"""

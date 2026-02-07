@@ -362,14 +362,14 @@ step1Next.addEventListener('click', async () => {
 });
 
 async function uploadFile() {
+    step1Next.disabled = true;
+    step1Next.innerHTML = '<span class="spinner"></span> Uploading...';
+    
     const formData = new FormData();
     formData.append('video', selectedFile);
-    formData.append('language', 'English'); // Will be set in step 3
-    formData.append('translation_service', 'openai');
-    formData.append('ollama_model', 'llama3.2');
     
     try {
-        const response = await fetch('/upload', {
+        const response = await fetch('/upload-only', {
             method: 'POST',
             body: formData
         });
@@ -397,6 +397,9 @@ async function uploadFile() {
         
     } catch (error) {
         showError(error.message);
+    } finally {
+        step1Next.disabled = false;
+        step1Next.innerHTML = 'Next <span class="btn-arrow">→</span>';
     }
 }
 
@@ -667,29 +670,19 @@ startTranslationBtn.addEventListener('click', async () => {
 async function startTranslation() {
     processingSection.style.display = 'block';
     translateNav.style.display = 'none';
-    updateProgress(5, 'Uploading video...');
+    updateProgress(5, 'Starting translation...');
     updateSteps('upload');
     
     try {
-        // We need to re-upload with the correct language settings
-        // For now, start processing with current job
-        startStatusPolling();
-        
-        // Trigger processing by uploading the video with translation settings
-        const formData = new FormData();
-        
-        // Get the video file from the job's video path via video-preview endpoint
-        const videoBlob = await fetch(`/video-preview/${currentJobId}`).then(r => r.blob());
-        const videoFile = new File([videoBlob], 'video.mp4', { type: 'video/mp4' });
-        
-        formData.append('video', videoFile);
-        formData.append('language', getSelectedLanguage());
-        formData.append('translation_service', getSelectedService());
-        formData.append('ollama_model', ollamaModel.value);
-        
-        const response = await fetch('/upload', {
+        // Use the process endpoint for already downloaded/uploaded videos
+        const response = await fetch(`/process/${currentJobId}`, {
             method: 'POST',
-            body: formData
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                language: getSelectedLanguage(),
+                translation_service: getSelectedService(),
+                ollama_model: ollamaModel.value
+            })
         });
         
         if (!response.ok) {
@@ -699,6 +692,9 @@ async function startTranslation() {
         
         const data = await response.json();
         currentJobId = data.job_id;
+        
+        // Start polling for status
+        startStatusPolling();
         
     } catch (error) {
         showError(error.message);
