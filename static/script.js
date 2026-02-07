@@ -1,16 +1,16 @@
 /**
- * SubtitleAI - Wizard-based Frontend JavaScript
- * Handles video download, trimming, translation, subtitle editing, and export
+ * SubtitleAI Studio — Single-page state-driven frontend
  */
 
 // ============================================
 // State
 // ============================================
-let currentStep = 1;
+let currentPanelState = 'source';
 let selectedFile = null;
 let videoUrl = null;
 let videoInfo = null;
 let currentJobId = null;
+let videoLoaded = false; // true once video is in the player
 let statusInterval = null;
 let downloadInterval = null;
 let reburnInterval = null;
@@ -24,12 +24,18 @@ let hasEdits = false;
 // DOM Elements
 // ============================================
 
-// Wizard
-const wizardIndicator = document.getElementById('wizard-indicator');
-const wizardSteps = document.querySelectorAll('.wizard-step');
+// Video
+const studioVideo = document.getElementById('studio-video');
+const videoPlaceholder = document.getElementById('video-placeholder');
+const currentSubtitleEl = document.getElementById('current-subtitle');
 
-// Step 1: Source
-const stepSource = document.getElementById('step-source');
+// Control Panel states
+const panelSource = document.getElementById('panel-source');
+const panelDownloading = document.getElementById('panel-downloading');
+const panelProcessing = document.getElementById('panel-processing');
+const panelEditor = document.getElementById('panel-editor');
+
+// Source panel
 const dropZone = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
 const filePreview = document.getElementById('file-preview');
@@ -45,11 +51,31 @@ const urlDuration = document.getElementById('url-duration');
 const removeUrlBtn = document.getElementById('remove-url');
 const urlLoading = document.getElementById('url-loading');
 const urlError = document.getElementById('url-error');
-const step1Next = document.getElementById('step1-next');
+const languageToggle = document.getElementById('language-toggle');
+const serviceToggle = document.getElementById('service-toggle');
+const ollamaOptions = document.getElementById('ollama-options');
+const ollamaModel = document.getElementById('ollama-model');
+const btnTranslate = document.getElementById('btn-translate');
 
-// Step 2: Trim
-const stepTrim = document.getElementById('step-trim');
-const trimVideo = document.getElementById('trim-video');
+// Downloading panel
+const downloadProgressBar = document.getElementById('download-progress-bar');
+const downloadStatusText = document.getElementById('download-status-text');
+
+// Processing panel
+const progressBar = document.getElementById('progress-bar');
+const statusText = document.getElementById('status-text');
+const processingError = document.getElementById('processing-error');
+const processingErrorText = document.getElementById('processing-error-text');
+const processingRetryBtn = document.getElementById('processing-retry-btn');
+
+// Editor panel
+const subtitleList = document.getElementById('subtitle-list');
+const subtitleCount = document.getElementById('subtitle-count');
+const btnSkipEdit = document.getElementById('btn-skip-edit');
+const btnSaveExport = document.getElementById('btn-save-export');
+
+// Trim section
+const trimSection = document.getElementById('trim-section');
 const trimSlider = document.getElementById('trim-slider');
 const trimRange = document.getElementById('trim-range');
 const trimHandleStart = document.getElementById('trim-handle-start');
@@ -59,38 +85,9 @@ const trimEndTime = document.getElementById('trim-end-time');
 const trimDurationEl = document.getElementById('trim-duration');
 const trimThumbnails = document.getElementById('trim-thumbnails');
 const trimPlayhead = document.getElementById('trim-playhead');
-const downloadProgress = document.getElementById('download-progress');
-const downloadProgressBar = document.getElementById('download-progress-bar');
-const downloadStatusText = document.getElementById('download-status-text');
-const step2Back = document.getElementById('step2-back');
-const step2Skip = document.getElementById('step2-skip');
-const step2Next = document.getElementById('step2-next');
 
-// Step 3: Translate
-const stepTranslate = document.getElementById('step-translate');
-const languageToggle = document.getElementById('language-toggle');
-const serviceToggle = document.getElementById('service-toggle');
-const ollamaOptions = document.getElementById('ollama-options');
-const ollamaModel = document.getElementById('ollama-model');
-const processingSection = document.getElementById('processing-section');
-const translateNav = document.getElementById('translate-nav');
-const progressBar = document.getElementById('progress-bar');
-const statusText = document.getElementById('status-text');
-const step3Back = document.getElementById('step3-back');
-const startTranslationBtn = document.getElementById('start-translation');
-
-// Step 4: Edit
-const stepEdit = document.getElementById('step-edit');
-const editorVideo = document.getElementById('editor-video');
-const currentSubtitle = document.getElementById('current-subtitle');
-const timeline = document.getElementById('timeline');
-const timelinePlayhead = document.getElementById('timeline-playhead');
-const subtitleList = document.getElementById('subtitle-list');
-const step4Skip = document.getElementById('step4-skip');
-const step4Next = document.getElementById('step4-next');
-
-// Step 5: Export
-const stepExport = document.getElementById('step-export');
+// Export section
+const exportSection = document.getElementById('export-section');
 const elapsedTimeEl = document.getElementById('elapsed-time');
 const inputTokensEl = document.getElementById('input-tokens');
 const outputTokensEl = document.getElementById('output-tokens');
@@ -105,76 +102,36 @@ const downloadTranscriptionBtn = document.getElementById('download-transcription
 const downloadTranscriptionTxtBtn = document.getElementById('download-transcription-txt-btn');
 const newVideoBtn = document.getElementById('new-video-btn');
 
-// Error section
-const errorSection = document.getElementById('error-section');
-const errorMessage = document.getElementById('error-message');
-const retryBtn = document.getElementById('retry-btn');
-
 // ============================================
-// Wizard Navigation
+// Panel State Machine
 // ============================================
 
-function goToStep(step) {
-    // Pause all videos when leaving any step
-    trimVideo.pause();
-    editorVideo.pause();
-    
-    // Clear trim video source when leaving trim step to prevent stale error events
-    if (currentStep === 2 && step !== 2) {
-        trimVideo.removeAttribute('src');
-        trimVideo.load();
-    }
-    
-    currentStep = step;
-    clearAllIntervals();
-    
-    // Update wizard indicator
-    wizardSteps.forEach((el, index) => {
-        const stepNum = index + 1;
-        el.classList.remove('active', 'completed');
-        if (stepNum < step) {
-            el.classList.add('completed');
-        } else if (stepNum === step) {
-            el.classList.add('active');
-        }
-    });
-    
-    // Hide all steps
-    [stepSource, stepTrim, stepTranslate, stepEdit, stepExport, errorSection].forEach(el => {
+function setPanelState(state) {
+    currentPanelState = state;
+    // Hide all panel states
+    [panelSource, panelDownloading, panelProcessing, panelEditor].forEach(el => {
         el.style.display = 'none';
     });
-    
-    // Show current step
-    switch (step) {
-        case 1:
-            stepSource.style.display = 'block';
+    // Show requested
+    switch (state) {
+        case 'source':
+            panelSource.style.display = 'flex';
             break;
-        case 2:
-            stepTrim.style.display = 'block';
+        case 'downloading':
+            panelDownloading.style.display = 'flex';
             break;
-        case 3:
-            stepTranslate.style.display = 'block';
+        case 'processing':
+            panelProcessing.style.display = 'flex';
+            processingError.style.display = 'none';
             break;
-        case 4:
-            stepEdit.style.display = 'block';
-            break;
-        case 5:
-            stepExport.style.display = 'block';
+        case 'editor':
+            panelEditor.style.display = 'flex';
             break;
     }
 }
 
-function showError(message) {
-    clearAllIntervals();
-    errorMessage.textContent = message;
-    [stepSource, stepTrim, stepTranslate, stepEdit, stepExport].forEach(el => {
-        el.style.display = 'none';
-    });
-    errorSection.style.display = 'block';
-}
-
 // ============================================
-// Utility Functions
+// Utilities
 // ============================================
 
 function clearAllIntervals() {
@@ -201,29 +158,58 @@ function formatTimeFull(seconds) {
     const hrs = Math.floor(seconds / 3600);
     const mins = Math.floor((seconds % 3600) / 60);
     const secs = Math.floor(seconds % 60);
-    if (hrs > 0) {
-        return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
+    if (hrs > 0) return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+function formatTimePrecise(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toFixed(1).padStart(4, '0')}`;
 }
 
 function debounce(func, wait) {
     let timeout;
-    return function executedFunction(...args) {
-        const later = () => {
-            clearTimeout(timeout);
-            func(...args);
-        };
+    return function (...args) {
         clearTimeout(timeout);
-        timeout = setTimeout(later, wait);
+        timeout = setTimeout(() => func(...args), wait);
     };
 }
 
+function showError(message) {
+    // Inline error in processing panel
+    processingErrorText.textContent = message;
+    processingError.style.display = 'block';
+    setPanelState('processing');
+    // Hide progress UI
+    progressBar.parentElement.style.display = 'none';
+    statusText.style.display = 'none';
+    document.querySelector('.progress-steps').style.display = 'none';
+}
+
 // ============================================
-// Step 1: Source Selection
+// Video Loading
 // ============================================
 
-// File upload handlers
+function loadVideoPreview() {
+    studioVideo.src = `/video-preview/${currentJobId}`;
+    videoPlaceholder.style.display = 'none';
+}
+
+async function fetchAndShowDuration() {
+    const resp = await fetch(`/video-duration/${currentJobId}`);
+    const data = await resp.json();
+    videoDuration = data.duration;
+    trimStart = 0;
+    trimEnd = videoDuration;
+    updateTrimUI();
+    trimSection.style.display = 'block';
+}
+
+// ============================================
+// Source Panel — File Upload
+// ============================================
+
 dropZone.addEventListener('dragover', (e) => {
     e.preventDefault();
     dropZone.classList.add('drag-over');
@@ -236,19 +222,13 @@ dropZone.addEventListener('dragleave', () => {
 dropZone.addEventListener('drop', (e) => {
     e.preventDefault();
     dropZone.classList.remove('drag-over');
-    if (e.dataTransfer.files.length > 0) {
-        handleFileSelect(e.dataTransfer.files[0]);
-    }
+    if (e.dataTransfer.files.length > 0) handleFileSelect(e.dataTransfer.files[0]);
 });
 
-dropZone.addEventListener('click', () => {
-    fileInput.click();
-});
+dropZone.addEventListener('click', () => fileInput.click());
 
 fileInput.addEventListener('change', (e) => {
-    if (e.target.files.length > 0) {
-        handleFileSelect(e.target.files[0]);
-    }
+    if (e.target.files.length > 0) handleFileSelect(e.target.files[0]);
 });
 
 removeFileBtn.addEventListener('click', (e) => {
@@ -258,29 +238,25 @@ removeFileBtn.addEventListener('click', (e) => {
 
 function handleFileSelect(file) {
     const validTypes = ['.mp4', '.mov', '.avi', '.mkv'];
-    const extension = '.' + file.name.split('.').pop().toLowerCase();
-    
-    if (!validTypes.includes(extension)) {
+    const ext = '.' + file.name.split('.').pop().toLowerCase();
+    if (!validTypes.includes(ext)) {
         alert('Please select a valid video file (MP4, MOV, AVI, or MKV)');
         return;
     }
-    
+
     selectedFile = file;
     videoUrl = null;
     videoInfo = null;
-    
-    // Clear URL input
+    videoLoaded = false;
     videoUrlInput.value = '';
     urlPreview.style.display = 'none';
     urlSourceIcon.textContent = '';
-    
-    // Update UI
+
     fileName.textContent = file.name;
     fileSize.textContent = formatFileSize(file.size);
     dropZone.style.display = 'none';
     filePreview.style.display = 'block';
-    
-    updateStep1NextButton();
+    updateTranslateButton();
 }
 
 function clearFile() {
@@ -288,24 +264,26 @@ function clearFile() {
     fileInput.value = '';
     dropZone.style.display = 'block';
     filePreview.style.display = 'none';
-    updateStep1NextButton();
+    updateTranslateButton();
 }
 
-// URL input handlers
+// ============================================
+// Source Panel — URL Input
+// ============================================
+
 const handleUrlInput = debounce(async () => {
     const url = videoUrlInput.value.trim();
-    
     if (!url) {
         urlSourceIcon.textContent = '';
         urlPreview.style.display = 'none';
         urlError.style.display = 'none';
         videoUrl = null;
         videoInfo = null;
-        updateStep1NextButton();
+        updateTranslateButton();
         return;
     }
-    
-    // Detect source
+
+    // Detect source icon
     if (url.includes('youtube.com') || url.includes('youtu.be')) {
         urlSourceIcon.textContent = '▶️';
     } else if (url.includes('twitter.com') || url.includes('x.com')) {
@@ -313,39 +291,26 @@ const handleUrlInput = debounce(async () => {
     } else {
         urlSourceIcon.textContent = '❓';
     }
-    
-    // Fetch video info
+
     urlLoading.style.display = 'flex';
     urlError.style.display = 'none';
     urlPreview.style.display = 'none';
-    
+
     try {
         const response = await fetch(`/video-info?url=${encodeURIComponent(url)}`);
         const data = await response.json();
-        
-        if (!response.ok) {
-            throw new Error(data.detail || 'Failed to fetch video info');
-        }
-        
+        if (!response.ok) throw new Error(data.detail || 'Failed to fetch video info');
+
         videoUrl = url;
         videoInfo = data;
         selectedFile = null;
-        
-        // Clear file selection
         clearFile();
-        
-        // Show preview
+
         urlThumbnail.src = data.thumbnail || '';
         urlTitle.textContent = data.title;
         urlDuration.textContent = `Duration: ${formatTimeFull(data.duration)}`;
         urlPreview.style.display = 'flex';
-        
-        if (data.source === 'youtube') {
-            urlSourceIcon.textContent = '▶️';
-        } else if (data.source === 'twitter') {
-            urlSourceIcon.textContent = '𝕏';
-        }
-        
+
     } catch (error) {
         urlError.textContent = error.message;
         urlError.style.display = 'block';
@@ -353,7 +318,7 @@ const handleUrlInput = debounce(async () => {
         videoInfo = null;
     } finally {
         urlLoading.style.display = 'none';
-        updateStep1NextButton();
+        updateTranslateButton();
     }
 }, 500);
 
@@ -366,194 +331,587 @@ removeUrlBtn.addEventListener('click', () => {
     urlError.style.display = 'none';
     videoUrl = null;
     videoInfo = null;
-    updateStep1NextButton();
+    updateTranslateButton();
 });
 
-function updateStep1NextButton() {
-    step1Next.disabled = !(selectedFile || videoUrl);
+// ============================================
+// Source Panel — Toggles
+// ============================================
+
+function setActiveToggle(container, activeBtn) {
+    container.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
+    activeBtn.classList.add('active');
 }
 
-step1Next.addEventListener('click', async () => {
-    if (selectedFile) {
-        // Upload file and get job ID
-        await uploadFile();
-    } else if (videoUrl) {
-        // Download from URL
-        await downloadFromUrl();
+languageToggle.addEventListener('click', (e) => {
+    if (e.target.classList.contains('toggle-btn')) setActiveToggle(languageToggle, e.target);
+});
+
+serviceToggle.addEventListener('click', (e) => {
+    if (e.target.classList.contains('toggle-btn')) {
+        setActiveToggle(serviceToggle, e.target);
+        const isOllama = e.target.dataset.value === 'ollama';
+        ollamaOptions.style.display = isOllama ? 'flex' : 'none';
+        if (isOllama) loadOllamaModels();
     }
 });
 
-async function uploadFile() {
-    step1Next.disabled = true;
-    step1Next.innerHTML = '<span class="spinner"></span> Uploading...';
-    
-    const formData = new FormData();
-    formData.append('video', selectedFile);
-    
+async function loadOllamaModels() {
     try {
-        const response = await fetch('/upload-only', {
-            method: 'POST',
-            body: formData
-        });
-        
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Upload failed');
+        const resp = await fetch('/ollama-models');
+        const data = await resp.json();
+        if (data.models && data.models.length > 0) {
+            ollamaModel.innerHTML = '';
+            data.models.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                ollamaModel.appendChild(opt);
+            });
         }
-        
-        const data = await response.json();
+    } catch (e) {
+        console.error('Failed to load Ollama models:', e);
+    }
+}
+
+function getSelectedLanguage() {
+    const btn = languageToggle.querySelector('.toggle-btn.active');
+    return btn ? btn.dataset.value : 'English';
+}
+
+function getSelectedService() {
+    const btn = serviceToggle.querySelector('.toggle-btn.active');
+    return btn ? btn.dataset.value : 'openai';
+}
+
+// ============================================
+// Translate Button
+// ============================================
+
+function updateTranslateButton() {
+    if (videoLoaded) {
+        btnTranslate.disabled = false;
+        btnTranslate.innerHTML = '<span class="btn-icon">✨</span> Translate';
+    } else {
+        btnTranslate.disabled = !(selectedFile || videoUrl);
+        if (selectedFile) {
+            btnTranslate.innerHTML = '<span class="btn-icon">📤</span> Upload & Preview';
+        } else if (videoUrl) {
+            btnTranslate.innerHTML = '<span class="btn-icon">⬇️</span> Download & Preview';
+        } else {
+            btnTranslate.innerHTML = '<span class="btn-icon">✨</span> Translate';
+        }
+    }
+}
+
+btnTranslate.addEventListener('click', async () => {
+    if (videoLoaded) {
+        // Phase 2: start translation
+        await applyTrimAndTranslate();
+    } else if (selectedFile) {
+        // Phase 1: upload and preview
+        await uploadAndPreview();
+    } else if (videoUrl) {
+        // Phase 1: download and preview
+        await downloadAndPreview();
+    }
+});
+
+async function uploadAndPreview() {
+    btnTranslate.disabled = true;
+    btnTranslate.innerHTML = '<span class="spinner"></span> Uploading...';
+
+    try {
+        const formData = new FormData();
+        formData.append('video', selectedFile);
+
+        const resp = await fetch('/upload-only', { method: 'POST', body: formData });
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Upload failed');
+        }
+        const data = await resp.json();
         currentJobId = data.job_id;
-        
-        // Get video duration
-        const durationResponse = await fetch(`/video-duration/${currentJobId}`);
-        const durationData = await durationResponse.json();
-        videoDuration = durationData.duration;
-        
-        // Set up trim video preview
-        trimVideo.src = `/video-preview/${currentJobId}`;
-        trimStart = 0;
-        trimEnd = videoDuration;
-        updateTrimUI();
-        
-        goToStep(2);
-        
+
+        loadVideoPreview();
+        await fetchAndShowDuration();
+        videoLoaded = true;
+        updateTranslateButton();
+
     } catch (error) {
         showError(error.message);
     } finally {
-        step1Next.disabled = false;
-        step1Next.innerHTML = 'Next <span class="btn-arrow">→</span>';
+        btnTranslate.disabled = false;
+        updateTranslateButton();
     }
 }
 
-async function downloadFromUrl() {
-    goToStep(2);
-    
-    // Show download progress
-    downloadProgress.style.display = 'block';
-    step2Next.disabled = true;
-    step2Skip.disabled = true;
-    
+async function downloadAndPreview() {
+    btnTranslate.disabled = true;
+    setPanelState('downloading');
+    downloadProgressBar.style.width = '0%';
+    downloadStatusText.textContent = 'Starting download...';
+
     try {
-        const response = await fetch('/download-url', {
+        const resp = await fetch('/download-url', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: videoUrl, quality: '720p' })
         });
-        
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Download failed');
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Download failed');
         }
-        
-        const data = await response.json();
+        const data = await resp.json();
         currentJobId = data.job_id;
-        
+
         // Poll download status
         await pollDownloadStatus();
-        
+
+        // Download complete — load video, go back to source panel
+        loadVideoPreview();
+        await fetchAndShowDuration();
+        videoLoaded = true;
+        setPanelState('source');
+        updateTranslateButton();
+
     } catch (error) {
         showError(error.message);
+    } finally {
+        btnTranslate.disabled = false;
+        updateTranslateButton();
     }
 }
 
-async function pollDownloadStatus() {
+function pollDownloadStatus() {
     return new Promise((resolve, reject) => {
         downloadInterval = setInterval(async () => {
             try {
-                const response = await fetch(`/download-status/${currentJobId}`);
-                const data = await response.json();
-                
+                const resp = await fetch(`/download-status/${currentJobId}`);
+                const data = await resp.json();
+
                 downloadProgressBar.style.width = `${data.progress}%`;
-                downloadStatusText.textContent = data.download_status === 'processing' 
-                    ? 'Processing video...' 
+                downloadStatusText.textContent = data.download_status === 'processing'
+                    ? 'Processing video...'
                     : `Downloading: ${data.progress}%`;
-                
+
                 if (data.status === 'downloaded') {
                     clearInterval(downloadInterval);
                     downloadInterval = null;
-                    downloadProgress.style.display = 'none';
-                    
-                    // Get video duration
-                    const durationResponse = await fetch(`/video-duration/${currentJobId}`);
-                    const durationData = await durationResponse.json();
-                    videoDuration = durationData.duration;
-                    
-                    // Set up trim video preview
-                    trimVideo.src = `/video-preview/${currentJobId}`;
-                    trimStart = 0;
-                    trimEnd = videoDuration;
-                    updateTrimUI();
-                    
-                    step2Next.disabled = false;
-                    step2Skip.disabled = false;
-                    
                     resolve();
                 } else if (data.status === 'error') {
                     clearInterval(downloadInterval);
                     downloadInterval = null;
                     reject(new Error(data.error || 'Download failed'));
                 }
-            } catch (error) {
+            } catch (err) {
                 clearInterval(downloadInterval);
                 downloadInterval = null;
-                reject(error);
+                reject(err);
             }
         }, 1000);
     });
 }
 
 // ============================================
-// Step 2: Trim Video
+// Trim + Translate Flow
+// ============================================
+
+async function applyTrimAndTranslate() {
+    // Check if trim was changed
+    const trimChanged = Math.abs(trimStart) > 0.5 || Math.abs(trimEnd - videoDuration) > 0.5;
+
+    if (trimChanged) {
+        setPanelState('processing');
+        updateProgress(5, 'Trimming video...');
+        try {
+            const resp = await fetch(`/trim/${currentJobId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ start_time: trimStart, end_time: trimEnd })
+            });
+            if (!resp.ok) {
+                const err = await resp.json();
+                throw new Error(err.detail || 'Trim failed');
+            }
+        } catch (error) {
+            showError(error.message);
+            return;
+        }
+    } else {
+        try {
+            await fetch(`/skip-trim/${currentJobId}`, { method: 'POST' });
+        } catch (e) {
+            // Non-critical
+        }
+    }
+
+    await startTranslation();
+}
+
+async function startTranslation() {
+    setPanelState('processing');
+    updateProgress(5, 'Starting translation...');
+    updateSteps('extract');
+
+    // Show progress UI (might have been hidden by error)
+    progressBar.parentElement.style.display = '';
+    statusText.style.display = '';
+    document.querySelector('.progress-steps').style.display = '';
+
+    try {
+        const resp = await fetch(`/process/${currentJobId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                language: getSelectedLanguage(),
+                translation_service: getSelectedService(),
+                ollama_model: ollamaModel.value
+            })
+        });
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Processing failed');
+        }
+        const data = await resp.json();
+        currentJobId = data.job_id;
+
+        startStatusPolling();
+    } catch (error) {
+        showError(error.message);
+    }
+}
+
+function startStatusPolling() {
+    statusInterval = setInterval(async () => {
+        try {
+            const resp = await fetch(`/status/${currentJobId}`);
+            const data = await resp.json();
+
+            updateProgressFromStatus(data);
+
+            if (data.status === 'completed') {
+                clearInterval(statusInterval);
+                statusInterval = null;
+
+                // Store stats
+                if (data.elapsed_time) elapsedTimeEl.textContent = data.elapsed_time;
+                if (data.token_usage) {
+                    inputTokensEl.textContent = data.token_usage.prompt_tokens?.toLocaleString() || '--';
+                    outputTokensEl.textContent = data.token_usage.completion_tokens?.toLocaleString() || '--';
+                    if (data.token_usage.total_cost !== undefined) {
+                        totalCostEl.textContent = '$' + data.token_usage.total_cost.toFixed(4);
+                    }
+                }
+
+                // Hide trim section — no longer needed
+                trimSection.style.display = 'none';
+
+                // Reload video with burned-in subtitles
+                studioVideo.src = `/video-preview/${currentJobId}?t=${Date.now()}`;
+
+                await loadSubtitles();
+                setPanelState('editor');
+
+            } else if (data.status === 'error') {
+                clearInterval(statusInterval);
+                statusInterval = null;
+                showError(data.error || 'An error occurred during processing');
+            }
+        } catch (error) {
+            console.error('Status polling error:', error);
+        }
+    }, 2000);
+}
+
+function updateProgressFromStatus(data) {
+    const msgs = {
+        'queued': 'Waiting in queue...',
+        'extracting_audio': 'Extracting audio from video...',
+        'transcribing': 'Transcribing speech with AI...',
+        'translating': 'Translating subtitles...',
+        'embedding_subtitles': 'Embedding subtitles into video...',
+        'completed': 'Processing complete!'
+    };
+    const stepMap = {
+        'queued': 'extract',
+        'extracting_audio': 'extract',
+        'transcribing': 'transcribe',
+        'translating': 'translate',
+        'embedding_subtitles': 'embed',
+        'completed': 'embed'
+    };
+    updateProgress(data.progress, msgs[data.status] || data.status);
+    updateSteps(stepMap[data.status]);
+}
+
+function updateProgress(percent, message) {
+    progressBar.style.width = percent + '%';
+    statusText.textContent = message;
+}
+
+function updateSteps(currentStepName) {
+    const stepIds = {
+        'extract': 'step-extract',
+        'transcribe': 'step-transcribe',
+        'translate': 'step-translate-progress',
+        'embed': 'step-embed'
+    };
+    const order = ['extract', 'transcribe', 'translate', 'embed'];
+    const idx = order.indexOf(currentStepName);
+
+    order.forEach((s, i) => {
+        const el = document.getElementById(stepIds[s]);
+        if (el) {
+            el.classList.remove('active', 'completed');
+            if (i < idx) el.classList.add('completed');
+            else if (i === idx) el.classList.add('active');
+        }
+    });
+}
+
+// ============================================
+// Subtitle Editor
+// ============================================
+
+async function loadSubtitles() {
+    try {
+        const resp = await fetch(`/subtitles/${currentJobId}`);
+        const data = await resp.json();
+        subtitles = data.subtitles;
+        renderSubtitleEditor();
+    } catch (e) {
+        console.error('Failed to load subtitles:', e);
+    }
+}
+
+function renderSubtitleEditor() {
+    subtitleCount.textContent = `${subtitles.length} segments`;
+
+    subtitleList.innerHTML = '';
+    subtitles.forEach(sub => {
+        const item = document.createElement('div');
+        item.className = 'subtitle-item';
+        item.dataset.id = sub.id;
+
+        const originalDiv = document.createElement('div');
+        originalDiv.className = 'subtitle-original';
+        originalDiv.dir = 'auto';
+        originalDiv.textContent = sub.original_text;
+
+        const textarea = document.createElement('textarea');
+        textarea.className = 'subtitle-text-input';
+        textarea.rows = 2;
+        textarea.dir = 'auto';
+        textarea.dataset.id = sub.id;
+        textarea.value = sub.text;
+
+        const timeDiv = document.createElement('div');
+        timeDiv.className = 'subtitle-time';
+        timeDiv.textContent = `${formatTime(sub.start)} → ${formatTime(sub.end)}`;
+
+        item.appendChild(timeDiv);
+        item.appendChild(originalDiv);
+        item.appendChild(textarea);
+
+        item.addEventListener('click', (e) => {
+            if (e.target.tagName !== 'TEXTAREA') {
+                studioVideo.currentTime = sub.start;
+                highlightSubtitle(sub.id);
+            }
+        });
+
+        textarea.addEventListener('input', () => {
+            hasEdits = true;
+            const idx = subtitles.findIndex(s => s.id === sub.id);
+            if (idx !== -1) subtitles[idx].text = textarea.value;
+        });
+        textarea.addEventListener('focus', () => highlightSubtitle(sub.id));
+
+        subtitleList.appendChild(item);
+    });
+
+    // Set up subtitle overlay sync
+    setupSubtitleSync();
+}
+
+function setupSubtitleSync() {
+    // Remove previous listener to avoid duplicates
+    studioVideo.removeEventListener('timeupdate', onVideoTimeUpdate);
+    studioVideo.addEventListener('timeupdate', onVideoTimeUpdate);
+}
+
+function onVideoTimeUpdate() {
+    const t = studioVideo.currentTime;
+    const current = subtitles.find(s => t >= s.start && t <= s.end);
+
+    if (current) {
+        // Only show overlay subtitle when NOT in editor mode (burned video already has them)
+        if (currentPanelState !== 'editor') {
+            currentSubtitleEl.textContent = current.text;
+            currentSubtitleEl.dir = 'auto';
+            currentSubtitleEl.style.display = 'block';
+        } else {
+            currentSubtitleEl.style.display = 'none';
+        }
+        if (currentPanelState === 'editor') highlightSubtitle(current.id);
+    } else {
+        currentSubtitleEl.style.display = 'none';
+    }
+
+    // Update trim playhead
+    if (videoDuration > 0) {
+        trimPlayhead.style.left = `${(t / videoDuration) * 100}%`;
+    }
+}
+
+function highlightSubtitle(id) {
+    document.querySelectorAll('.subtitle-item').forEach(item => {
+        item.classList.toggle('active', parseInt(item.dataset.id) === id);
+    });
+    // No auto-scroll — let user scroll freely while editing
+}
+
+// Editor actions
+btnSkipEdit.addEventListener('click', () => {
+    showExportSection();
+});
+
+btnSaveExport.addEventListener('click', async () => {
+    if (hasEdits) {
+        await saveSubtitlesAndReburn();
+    } else {
+        showExportSection();
+    }
+});
+
+async function saveSubtitlesAndReburn() {
+    btnSaveExport.disabled = true;
+    btnSaveExport.innerHTML = '<span class="spinner"></span> Saving...';
+
+    try {
+        const updates = subtitles.map(s => ({ id: s.id, text: s.text }));
+        await fetch(`/subtitles/${currentJobId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ subtitles: updates })
+        });
+
+        await fetch(`/reburn/${currentJobId}`, { method: 'POST' });
+
+        showExportSection();
+
+        // Show reburn progress
+        reburnProgress.style.display = 'block';
+        downloadVideoBtn.disabled = true;
+        await pollReburnStatus();
+    } catch (error) {
+        showError(error.message);
+    } finally {
+        btnSaveExport.disabled = false;
+        btnSaveExport.innerHTML = '<span class="btn-icon">💾</span> Save & Export';
+    }
+}
+
+function pollReburnStatus() {
+    return new Promise((resolve, reject) => {
+        reburnInterval = setInterval(async () => {
+            try {
+                const resp = await fetch(`/status/${currentJobId}`);
+                const data = await resp.json();
+
+                reburnProgressBar.style.width = `${data.progress}%`;
+                reburnStatusText.textContent = data.status === 'reburning'
+                    ? `Re-embedding subtitles: ${data.progress}%`
+                    : 'Finishing up...';
+
+                if (data.status === 'completed') {
+                    clearInterval(reburnInterval);
+                    reburnInterval = null;
+                    reburnProgress.style.display = 'none';
+                    downloadVideoBtn.disabled = false;
+                    // Reload video with new burned subtitles
+                    studioVideo.src = `/video-preview/${currentJobId}?t=${Date.now()}`;
+                    resolve();
+                } else if (data.status === 'error') {
+                    clearInterval(reburnInterval);
+                    reburnInterval = null;
+                    reject(new Error(data.error || 'Re-burn failed'));
+                }
+            } catch (err) {
+                clearInterval(reburnInterval);
+                reburnInterval = null;
+                reject(err);
+            }
+        }, 1000);
+    });
+}
+
+// ============================================
+// Export Section
+// ============================================
+
+function showExportSection() {
+    exportSection.style.display = 'block';
+    // Keep editor visible so user can still view subtitles
+}
+
+downloadVideoBtn.addEventListener('click', () => {
+    if (currentJobId) window.location.href = `/download/${currentJobId}`;
+});
+downloadSrtBtn.addEventListener('click', () => {
+    if (currentJobId) window.location.href = `/download-srt/${currentJobId}`;
+});
+downloadSrtTxtBtn.addEventListener('click', () => {
+    if (currentJobId) window.location.href = `/download-srt-txt/${currentJobId}`;
+});
+downloadTranscriptionBtn.addEventListener('click', () => {
+    if (currentJobId) window.location.href = `/download-transcription/${currentJobId}`;
+});
+downloadTranscriptionTxtBtn.addEventListener('click', () => {
+    if (currentJobId) window.location.href = `/download-transcription-txt/${currentJobId}`;
+});
+
+newVideoBtn.addEventListener('click', resetApp);
+
+processingRetryBtn.addEventListener('click', resetApp);
+
+// ============================================
+// Trim Controls
 // ============================================
 
 function updateTrimUI() {
-    const duration = videoDuration || 1;
-    const startPercent = (trimStart / duration) * 100;
-    const endPercent = (trimEnd / duration) * 100;
-    
-    trimHandleStart.style.left = `${startPercent}%`;
-    trimHandleEnd.style.left = `${endPercent}%`;
-    trimRange.style.left = `${startPercent}%`;
-    trimRange.style.right = `${100 - endPercent}%`;
-    
+    const d = videoDuration || 1;
+    const sp = (trimStart / d) * 100;
+    const ep = (trimEnd / d) * 100;
+
+    trimHandleStart.style.left = `${sp}%`;
+    trimHandleEnd.style.left = `${ep}%`;
+    trimRange.style.left = `${sp}%`;
+    trimRange.style.right = `${100 - ep}%`;
+
     trimStartTime.value = formatTimePrecise(trimStart);
     trimEndTime.value = formatTimePrecise(trimEnd);
     trimDurationEl.textContent = `Duration: ${formatTimePrecise(trimEnd - trimStart)}`;
 }
 
-function formatTimePrecise(seconds) {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toFixed(1).padStart(4, '0')}`;
-}
-
-// Trim slider interaction
+// Trim drag
 let draggingHandle = null;
-let dragStartX = 0;
-let dragStartTime = 0;
 
 function handleTrimDrag(e) {
     if (!draggingHandle) return;
-    
     const rect = trimSlider.getBoundingClientRect();
-    const sliderWidth = rect.width;
-    
-    // Direct pixel-to-time mapping for precise control
-    let percent = (e.clientX - rect.left) / sliderWidth;
-    percent = Math.max(0, Math.min(1, percent));
-    let time = percent * videoDuration;
-    
-    // Round to 0.1s for clean values
-    time = Math.round(time * 10) / 10;
-    
+    let pct = (e.clientX - rect.left) / rect.width;
+    pct = Math.max(0, Math.min(1, pct));
+    let t = Math.round(pct * videoDuration * 10) / 10;
+
     if (draggingHandle === 'start') {
-        trimStart = Math.max(0, Math.min(time, trimEnd - 0.1));
-        trimVideo.currentTime = trimStart;
+        trimStart = Math.max(0, Math.min(t, trimEnd - 0.1));
+        studioVideo.currentTime = trimStart;
     } else {
-        trimEnd = Math.min(videoDuration, Math.max(time, trimStart + 0.1));
-        trimVideo.currentTime = trimEnd;
+        trimEnd = Math.min(videoDuration, Math.max(t, trimStart + 0.1));
+        studioVideo.currentTime = trimEnd;
     }
-    
     updateTrimUI();
 }
 
@@ -566,7 +924,7 @@ function stopTrimDrag() {
 function startTrimDrag(handle, e) {
     e.preventDefault();
     stopTrimDrag();
-    trimVideo.pause();
+    studioVideo.pause();
     draggingHandle = handle;
     document.addEventListener('mousemove', handleTrimDrag);
     document.addEventListener('mouseup', stopTrimDrag);
@@ -575,18 +933,15 @@ function startTrimDrag(handle, e) {
 trimHandleStart.addEventListener('mousedown', (e) => startTrimDrag('start', e));
 trimHandleEnd.addEventListener('mousedown', (e) => startTrimDrag('end', e));
 
-// Click on slider track to seek
+// Click slider to seek
 trimSlider.addEventListener('click', (e) => {
-    if (e.target === trimHandleStart || e.target === trimHandleEnd) return;
     if (e.target.closest('.trim-handle')) return;
     const rect = trimSlider.getBoundingClientRect();
-    let percent = (e.clientX - rect.left) / rect.width;
-    percent = Math.max(0, Math.min(1, percent));
-    const time = percent * videoDuration;
-    trimVideo.currentTime = time;
+    let pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    studioVideo.currentTime = pct * videoDuration;
 });
 
-// Make handles focusable for keyboard control
+// Keyboard controls
 trimHandleStart.setAttribute('tabindex', '0');
 trimHandleEnd.setAttribute('tabindex', '0');
 
@@ -597,12 +952,11 @@ function handleTrimKeydown(handle, e) {
         const delta = e.key === 'ArrowRight' ? step : -step;
         if (handle === 'start') {
             trimStart = Math.max(0, Math.min(trimStart + delta, trimEnd - 0.1));
-            trimVideo.currentTime = trimStart;
+            studioVideo.currentTime = trimStart;
         } else {
             trimEnd = Math.min(videoDuration, Math.max(trimEnd + delta, trimStart + 0.1));
-            trimVideo.currentTime = trimEnd;
+            studioVideo.currentTime = trimEnd;
         }
-        // Round to 0.1s
         trimStart = Math.round(trimStart * 10) / 10;
         trimEnd = Math.round(trimEnd * 10) / 10;
         updateTrimUI();
@@ -612,22 +966,20 @@ function handleTrimKeydown(handle, e) {
 trimHandleStart.addEventListener('keydown', (e) => handleTrimKeydown('start', e));
 trimHandleEnd.addEventListener('keydown', (e) => handleTrimKeydown('end', e));
 
-// Parse time input: accepts "MM:SS.s" or just seconds
+// Time inputs
 function parseTimeInput(value) {
     value = value.trim();
     const match = value.match(/^(\d+):(\d+\.?\d*)$/);
-    if (match) {
-        return parseInt(match[1]) * 60 + parseFloat(match[2]);
-    }
+    if (match) return parseInt(match[1]) * 60 + parseFloat(match[2]);
     const num = parseFloat(value);
     return isNaN(num) ? null : num;
 }
 
 trimStartTime.addEventListener('change', () => {
-    const time = parseTimeInput(trimStartTime.value);
-    if (time !== null && time >= 0 && time < trimEnd) {
-        trimStart = Math.round(time * 10) / 10;
-        trimVideo.currentTime = trimStart;
+    const t = parseTimeInput(trimStartTime.value);
+    if (t !== null && t >= 0 && t < trimEnd) {
+        trimStart = Math.round(t * 10) / 10;
+        studioVideo.currentTime = trimStart;
         updateTrimUI();
     } else {
         trimStartTime.value = formatTimePrecise(trimStart);
@@ -635,50 +987,39 @@ trimStartTime.addEventListener('change', () => {
 });
 
 trimEndTime.addEventListener('change', () => {
-    const time = parseTimeInput(trimEndTime.value);
-    if (time !== null && time > trimStart && time <= videoDuration) {
-        trimEnd = Math.round(time * 10) / 10;
-        trimVideo.currentTime = trimEnd;
+    const t = parseTimeInput(trimEndTime.value);
+    if (t !== null && t > trimStart && t <= videoDuration) {
+        trimEnd = Math.round(t * 10) / 10;
+        studioVideo.currentTime = trimEnd;
         updateTrimUI();
     } else {
         trimEndTime.value = formatTimePrecise(trimEnd);
     }
 });
 
-// Sync video with trim handles
-trimVideo.addEventListener('loadedmetadata', () => {
-    if (!videoDuration || isNaN(trimVideo.duration)) {
-        videoDuration = trimVideo.duration;
+// Thumbnail generation
+studioVideo.addEventListener('loadedmetadata', () => {
+    if (!videoDuration || isNaN(studioVideo.duration)) {
+        videoDuration = studioVideo.duration;
         trimEnd = videoDuration;
         updateTrimUI();
     }
     generateThumbnails();
 });
 
-// Update playhead position during video playback
-trimVideo.addEventListener('timeupdate', () => {
-    if (videoDuration > 0) {
-        const percent = (trimVideo.currentTime / videoDuration) * 100;
-        trimPlayhead.style.left = `${percent}%`;
-    }
-});
-
 function generateThumbnails() {
-    if (!trimVideo.duration || trimVideo.duration === Infinity) return;
-    
+    if (!studioVideo.duration || studioVideo.duration === Infinity) return;
+
     trimThumbnails.innerHTML = '';
     const count = 15;
-    const interval = trimVideo.duration / count;
-    let generated = 0;
-    
-    // Create a hidden video element for thumbnail extraction
+    const interval = studioVideo.duration / count;
+
     const thumbVideo = document.createElement('video');
-    thumbVideo.src = trimVideo.src;
+    thumbVideo.src = studioVideo.src;
     thumbVideo.crossOrigin = 'anonymous';
     thumbVideo.muted = true;
     thumbVideo.preload = 'auto';
-    
-    // Create placeholder images first
+
     for (let i = 0; i < count; i++) {
         const canvas = document.createElement('canvas');
         canvas.className = 'trim-thumbnail';
@@ -689,20 +1030,16 @@ function generateThumbnails() {
         ctx.fillRect(0, 0, 120, 68);
         trimThumbnails.appendChild(canvas);
     }
-    
-    thumbVideo.addEventListener('loadeddata', () => {
-        captureFrame(0);
-    });
-    
+
+    let generated = 0;
+
+    thumbVideo.addEventListener('loadeddata', () => captureFrame(0));
+
     function captureFrame(index) {
-        if (index >= count) {
-            thumbVideo.remove();
-            return;
-        }
-        const time = index * interval;
-        thumbVideo.currentTime = time;
+        if (index >= count) { thumbVideo.remove(); return; }
+        thumbVideo.currentTime = index * interval;
     }
-    
+
     thumbVideo.addEventListener('seeked', () => {
         const index = Math.round(thumbVideo.currentTime / interval);
         if (index < count) {
@@ -713,560 +1050,58 @@ function generateThumbnails() {
             }
         }
         generated++;
-        if (generated < count) {
-            captureFrame(generated);
-        } else {
-            thumbVideo.remove();
-        }
-    });
-}
-
-trimVideo.addEventListener('error', () => {
-    if (currentStep === 2) {
-        showError('Failed to load video preview. The file may be corrupt or unsupported.');
-    }
-});
-
-editorVideo.addEventListener('error', () => {
-    console.error('Editor video failed to load');
-});
-
-step2Back.addEventListener('click', () => {
-    goToStep(1);
-});
-
-step2Skip.addEventListener('click', async () => {
-    await skipTrim();
-});
-
-step2Next.addEventListener('click', async () => {
-    await applyTrim();
-});
-
-async function skipTrim() {
-    try {
-        await fetch(`/skip-trim/${currentJobId}`, { method: 'POST' });
-        goToStep(3);
-    } catch (error) {
-        showError(error.message);
-    }
-}
-
-async function applyTrim() {
-    // Check if trim is actually needed
-    if (Math.abs(trimStart - 0) < 0.5 && Math.abs(trimEnd - videoDuration) < 0.5) {
-        await skipTrim();
-        return;
-    }
-    
-    step2Next.disabled = true;
-    step2Next.innerHTML = '<span class="spinner"></span> Trimming...';
-    
-    try {
-        const response = await fetch(`/trim/${currentJobId}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                start_time: trimStart,
-                end_time: trimEnd
-            })
-        });
-        
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Trim failed');
-        }
-        
-        goToStep(3);
-        
-    } catch (error) {
-        showError(error.message);
-    } finally {
-        step2Next.disabled = false;
-        step2Next.innerHTML = 'Trim & Continue <span class="btn-arrow">→</span>';
-    }
-}
-
-// ============================================
-// Step 3: Translation
-// ============================================
-
-function setActiveToggle(container, activeBtn) {
-    container.querySelectorAll('.toggle-btn').forEach(btn => {
-        btn.classList.remove('active');
-    });
-    activeBtn.classList.add('active');
-}
-
-languageToggle.addEventListener('click', (e) => {
-    if (e.target.classList.contains('toggle-btn')) {
-        setActiveToggle(languageToggle, e.target);
-    }
-});
-
-serviceToggle.addEventListener('click', (e) => {
-    if (e.target.classList.contains('toggle-btn')) {
-        setActiveToggle(serviceToggle, e.target);
-        const isOllama = e.target.dataset.value === 'ollama';
-        ollamaOptions.style.display = isOllama ? 'flex' : 'none';
-        
-        if (isOllama) {
-            loadOllamaModels();
-        }
-    }
-});
-
-async function loadOllamaModels() {
-    try {
-        const response = await fetch('/ollama-models');
-        const data = await response.json();
-        
-        if (data.models && data.models.length > 0) {
-            ollamaModel.innerHTML = '';
-            data.models.forEach(model => {
-                const option = document.createElement('option');
-                option.value = model;
-                option.textContent = model;
-                ollamaModel.appendChild(option);
-            });
-        }
-    } catch (error) {
-        console.error('Failed to load Ollama models:', error);
-    }
-}
-
-function getSelectedLanguage() {
-    const activeBtn = languageToggle.querySelector('.toggle-btn.active');
-    return activeBtn ? activeBtn.dataset.value : 'English';
-}
-
-function getSelectedService() {
-    const activeBtn = serviceToggle.querySelector('.toggle-btn.active');
-    return activeBtn ? activeBtn.dataset.value : 'openai';
-}
-
-step3Back.addEventListener('click', () => {
-    goToStep(2);
-});
-
-startTranslationBtn.addEventListener('click', async () => {
-    await startTranslation();
-});
-
-async function startTranslation() {
-    processingSection.style.display = 'block';
-    translateNav.style.display = 'none';
-    updateProgress(5, 'Starting translation...');
-    updateSteps('upload');
-    
-    try {
-        // Use the process endpoint for already downloaded/uploaded videos
-        const response = await fetch(`/process/${currentJobId}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                language: getSelectedLanguage(),
-                translation_service: getSelectedService(),
-                ollama_model: ollamaModel.value
-            })
-        });
-        
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Processing failed');
-        }
-        
-        const data = await response.json();
-        currentJobId = data.job_id;
-        
-        // Start polling for status
-        startStatusPolling();
-        
-    } catch (error) {
-        showError(error.message);
-    }
-}
-
-function startStatusPolling() {
-    statusInterval = setInterval(async () => {
-        try {
-            const response = await fetch(`/status/${currentJobId}`);
-            const data = await response.json();
-            
-            updateProgressFromStatus(data);
-            
-            if (data.status === 'completed') {
-                clearInterval(statusInterval);
-                
-                // Store stats
-                if (data.elapsed_time) {
-                    elapsedTimeEl.textContent = data.elapsed_time;
-                }
-                if (data.token_usage) {
-                    inputTokensEl.textContent = data.token_usage.prompt_tokens?.toLocaleString() || '--';
-                    outputTokensEl.textContent = data.token_usage.completion_tokens?.toLocaleString() || '--';
-                    if (data.token_usage.total_cost !== undefined) {
-                        totalCostEl.textContent = '$' + data.token_usage.total_cost.toFixed(4);
-                    }
-                }
-                
-                // Load subtitles for editor
-                await loadSubtitles();
-                
-                // Go to edit step
-                goToStep(4);
-                
-            } else if (data.status === 'error') {
-                clearInterval(statusInterval);
-                showError(data.error || 'An error occurred during processing');
-            }
-            
-        } catch (error) {
-            console.error('Status polling error:', error);
-        }
-    }, 2000);
-}
-
-function updateProgressFromStatus(data) {
-    const statusMessages = {
-        'queued': 'Waiting in queue...',
-        'extracting_audio': 'Extracting audio from video...',
-        'transcribing': 'Transcribing speech with AI...',
-        'translating': 'Translating subtitles...',
-        'embedding_subtitles': 'Embedding subtitles into video...',
-        'completed': 'Processing complete!'
-    };
-    
-    const stepMapping = {
-        'queued': 'upload',
-        'extracting_audio': 'extract',
-        'transcribing': 'transcribe',
-        'translating': 'translate',
-        'embedding_subtitles': 'embed',
-        'completed': 'embed'
-    };
-    
-    updateProgress(data.progress, statusMessages[data.status] || data.status);
-    updateSteps(stepMapping[data.status]);
-}
-
-function updateProgress(percent, message) {
-    progressBar.style.width = percent + '%';
-    statusText.textContent = message;
-}
-
-function updateSteps(currentStepName) {
-    const stepIds = {
-        'upload': 'step-upload',
-        'extract': 'step-extract',
-        'transcribe': 'step-transcribe',
-        'translate': 'step-translate-progress',
-        'embed': 'step-embed'
-    };
-    const steps = ['upload', 'extract', 'transcribe', 'translate', 'embed'];
-    const currentIndex = steps.indexOf(currentStepName);
-    
-    steps.forEach((step, index) => {
-        const stepEl = document.getElementById(stepIds[step]);
-        if (stepEl) {
-            stepEl.classList.remove('active', 'completed');
-            
-            if (index < currentIndex) {
-                stepEl.classList.add('completed');
-            } else if (index === currentIndex) {
-                stepEl.classList.add('active');
-            }
-        }
+        if (generated < count) captureFrame(generated);
+        else thumbVideo.remove();
     });
 }
 
 // ============================================
-// Step 4: Subtitle Editor
+// Reset
 // ============================================
-
-async function loadSubtitles() {
-    try {
-        const response = await fetch(`/subtitles/${currentJobId}`);
-        const data = await response.json();
-        
-        subtitles = data.subtitles;
-        renderSubtitleEditor();
-        
-    } catch (error) {
-        console.error('Failed to load subtitles:', error);
-    }
-}
-
-function renderSubtitleEditor() {
-    // Set video source
-    editorVideo.src = `/video-preview/${currentJobId}`;
-    
-    // Update subtitle count
-    const countEl = document.getElementById('subtitle-count');
-    if (countEl) countEl.textContent = `${subtitles.length} segments`;
-    
-    // Get video duration for timeline
-    const totalDuration = subtitles.length > 0 
-        ? subtitles[subtitles.length - 1].end 
-        : 60;
-    
-    // Render timeline blocks
-    timeline.innerHTML = '';
-    subtitles.forEach((sub, index) => {
-        const block = document.createElement('div');
-        block.className = 'timeline-block';
-        block.dataset.id = sub.id;
-        
-        const left = (sub.start / totalDuration) * 100;
-        const width = ((sub.end - sub.start) / totalDuration) * 100;
-        
-        block.style.left = `${left}%`;
-        block.style.width = `${Math.max(width, 0.5)}%`;
-        block.textContent = sub.id;
-        
-        block.addEventListener('click', () => {
-            editorVideo.currentTime = sub.start;
-            highlightSubtitle(sub.id);
-        });
-        
-        timeline.appendChild(block);
-    });
-    
-    // Render subtitle list
-    subtitleList.innerHTML = '';
-    subtitles.forEach((sub, index) => {
-        const item = document.createElement('div');
-        item.className = 'subtitle-item';
-        item.dataset.id = sub.id;
-        
-        item.innerHTML = `
-            <div class="subtitle-time">
-                ${formatTime(sub.start)} → ${formatTime(sub.end)}
-            </div>
-            <div class="subtitle-content">
-                <div class="subtitle-original">${sub.original_text}</div>
-                <textarea class="subtitle-text-input" rows="2" data-id="${sub.id}">${sub.text}</textarea>
-            </div>
-        `;
-        
-        // Click on item (not textarea) to seek video
-        item.addEventListener('click', (e) => {
-            if (e.target.tagName !== 'TEXTAREA') {
-                editorVideo.currentTime = sub.start;
-                highlightSubtitle(sub.id);
-            }
-        });
-        
-        const textarea = item.querySelector('textarea');
-        textarea.addEventListener('input', () => {
-            hasEdits = true;
-            const idx = subtitles.findIndex(s => s.id === sub.id);
-            if (idx !== -1) {
-                subtitles[idx].text = textarea.value;
-            }
-        });
-        
-        textarea.addEventListener('focus', () => {
-            highlightSubtitle(sub.id);
-        });
-        
-        subtitleList.appendChild(item);
-    });
-    
-    // Update current subtitle display on video timeupdate
-    editorVideo.addEventListener('timeupdate', () => {
-        const currentTime = editorVideo.currentTime;
-        const totalDuration = subtitles.length > 0 
-            ? subtitles[subtitles.length - 1].end 
-            : 60;
-        
-        // Update playhead position
-        const playheadPos = (currentTime / totalDuration) * 100;
-        timelinePlayhead.style.left = `${playheadPos}%`;
-        
-        // Find current subtitle
-        const current = subtitles.find(s => currentTime >= s.start && currentTime <= s.end);
-        if (current) {
-            currentSubtitle.textContent = current.text;
-            currentSubtitle.style.display = 'block';
-            highlightSubtitle(current.id);
-        } else {
-            currentSubtitle.style.display = 'none';
-        }
-    });
-}
-
-function highlightSubtitle(id) {
-    // Highlight in timeline
-    document.querySelectorAll('.timeline-block').forEach(block => {
-        block.classList.toggle('active', parseInt(block.dataset.id) === id);
-    });
-    
-    // Highlight in list
-    document.querySelectorAll('.subtitle-item').forEach(item => {
-        item.classList.toggle('active', parseInt(item.dataset.id) === id);
-    });
-    
-    // Scroll into view
-    const activeItem = document.querySelector(`.subtitle-item[data-id="${id}"]`);
-    if (activeItem) {
-        activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }
-}
-
-step4Skip.addEventListener('click', () => {
-    goToStep(5);
-});
-
-step4Next.addEventListener('click', async () => {
-    if (hasEdits) {
-        await saveSubtitlesAndReburn();
-    } else {
-        goToStep(5);
-    }
-});
-
-async function saveSubtitlesAndReburn() {
-    step4Next.disabled = true;
-    step4Next.innerHTML = '<span class="spinner"></span> Saving...';
-    
-    try {
-        // Save subtitle edits
-        const updates = subtitles.map(s => ({ id: s.id, text: s.text }));
-        
-        await fetch(`/subtitles/${currentJobId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ subtitles: updates })
-        });
-        
-        // Start re-burn
-        await fetch(`/reburn/${currentJobId}`, { method: 'POST' });
-        
-        goToStep(5);
-        
-        // Show reburn progress
-        reburnProgress.style.display = 'block';
-        downloadVideoBtn.disabled = true;
-        
-        // Poll reburn status
-        await pollReburnStatus();
-        
-    } catch (error) {
-        showError(error.message);
-    } finally {
-        step4Next.disabled = false;
-        step4Next.innerHTML = 'Save & Continue <span class="btn-arrow">→</span>';
-    }
-}
-
-async function pollReburnStatus() {
-    return new Promise((resolve, reject) => {
-        reburnInterval = setInterval(async () => {
-            try {
-                const response = await fetch(`/status/${currentJobId}`);
-                const data = await response.json();
-                
-                reburnProgressBar.style.width = `${data.progress}%`;
-                reburnStatusText.textContent = data.status === 'reburning' 
-                    ? `Re-embedding subtitles: ${data.progress}%`
-                    : 'Finishing up...';
-                
-                if (data.status === 'completed') {
-                    clearInterval(reburnInterval);
-                    reburnInterval = null;
-                    reburnProgress.style.display = 'none';
-                    downloadVideoBtn.disabled = false;
-                    resolve();
-                } else if (data.status === 'error') {
-                    clearInterval(reburnInterval);
-                    reburnInterval = null;
-                    reject(new Error(data.error || 'Re-burn failed'));
-                }
-            } catch (error) {
-                clearInterval(reburnInterval);
-                reburnInterval = null;
-                reject(error);
-            }
-        }, 1000);
-    });
-}
-
-// ============================================
-// Step 5: Export
-// ============================================
-
-downloadVideoBtn.addEventListener('click', () => {
-    if (currentJobId) {
-        window.location.href = `/download/${currentJobId}`;
-    }
-});
-
-downloadSrtBtn.addEventListener('click', () => {
-    if (currentJobId) {
-        window.location.href = `/download-srt/${currentJobId}`;
-    }
-});
-
-downloadSrtTxtBtn.addEventListener('click', () => {
-    if (currentJobId) {
-        window.location.href = `/download-srt-txt/${currentJobId}`;
-    }
-});
-
-downloadTranscriptionBtn.addEventListener('click', () => {
-    if (currentJobId) {
-        window.location.href = `/download-transcription/${currentJobId}`;
-    }
-});
-
-downloadTranscriptionTxtBtn.addEventListener('click', () => {
-    if (currentJobId) {
-        window.location.href = `/download-transcription-txt/${currentJobId}`;
-    }
-});
-
-newVideoBtn.addEventListener('click', () => {
-    resetApp();
-});
-
-retryBtn.addEventListener('click', () => {
-    resetApp();
-});
 
 function resetApp() {
-    // Clear state
-    currentStep = 1;
     selectedFile = null;
     videoUrl = null;
     videoInfo = null;
     currentJobId = null;
+    videoLoaded = false;
     trimStart = 0;
     trimEnd = 0;
     videoDuration = 0;
     subtitles = [];
     hasEdits = false;
-    
+
     clearAllIntervals();
-    
-    // Reset UI
+
+    // Reset video
+    studioVideo.removeAttribute('src');
+    studioVideo.load();
+    videoPlaceholder.style.display = 'flex';
+    currentSubtitleEl.style.display = 'none';
+
+    // Reset source panel
     clearFile();
     videoUrlInput.value = '';
     urlSourceIcon.textContent = '';
     urlPreview.style.display = 'none';
     urlError.style.display = 'none';
-    processingSection.style.display = 'none';
-    translateNav.style.display = 'flex';
+
+    // Reset progress
     progressBar.style.width = '0%';
-    downloadProgress.style.display = 'none';
+    downloadProgressBar.style.width = '0%';
     reburnProgress.style.display = 'none';
-    
-    // Reset wizard steps
-    wizardSteps.forEach(step => {
-        step.classList.remove('active', 'completed');
-    });
-    
-    goToStep(1);
+
+    // Reset progress UI visibility
+    progressBar.parentElement.style.display = '';
+    statusText.style.display = '';
+    const stepsEl = document.querySelector('.progress-steps');
+    if (stepsEl) stepsEl.style.display = '';
+
+    // Hide sections
+    trimSection.style.display = 'none';
+    exportSection.style.display = 'none';
+
+    setPanelState('source');
 }
 
 // ============================================
@@ -1274,6 +1109,6 @@ function resetApp() {
 // ============================================
 
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('SubtitleAI Wizard initialized');
-    goToStep(1);
+    console.log('SubtitleAI Studio initialized');
+    setPanelState('source');
 });

@@ -114,13 +114,23 @@ def validate_job_id(job_id: str) -> bool:
 
 
 def find_video_path(job_id: str) -> Optional[str]:
-    """Find video file path for a job, checking job dict and filesystem."""
+    """Find video file path for a job. Prefers output (subtitled) video if available."""
     job = jobs.get(job_id)
     if not job:
+        print(f"[find_video_path] Job {job_id} not found in jobs dict")
         return None
+    
+    # Prefer the processed output video (with burned subtitles)
+    output_file = job.get("output_file")
+    if output_file:
+        output_path = OUTPUT_DIR / output_file
+        if output_path.exists():
+            print(f"[find_video_path] Found output video: {output_path}")
+            return str(output_path)
     
     video_path = job.get("video_path")
     if video_path and Path(video_path).exists():
+        print(f"[find_video_path] Found via job dict: {video_path}")
         return video_path
     
     # Search uploads and downloads directories
@@ -128,8 +138,10 @@ def find_video_path(job_id: str) -> Optional[str]:
         for ext in ['mp4', 'mov', 'avi', 'mkv']:
             for file in search_dir.iterdir():
                 if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
+                    print(f"[find_video_path] Found via filesystem search: {file}")
                     return str(file)
     
+    print(f"[find_video_path] No video found for job {job_id}")
     return None
 
 
@@ -612,6 +624,9 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
     start_time = time.time()
     temp_dir = None
     
+    print(f"[process_video] Job {job_id} — Processing video at: {video_path}")
+    print(f"[process_video] File exists: {Path(video_path).exists()}, size: {Path(video_path).stat().st_size if Path(video_path).exists() else 'N/A'}")
+    
     try:
         with jobs_lock:
             jobs[job_id]["status"] = "extracting_audio"
@@ -624,11 +639,17 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         srt_path_burning = os.path.join(temp_dir, "subtitles_burning.srt")
         
         # Check for audio stream before extraction
-        if not has_audio_stream(video_path):
+        audio_check = has_audio_stream(video_path)
+        print(f"[process_video] Audio stream check: {audio_check}")
+        if not audio_check:
             raise Exception("Video has no audio track. Cannot generate subtitles.")
         
         # Step 1: Extract audio
         extract_audio(video_path, audio_path)
+        audio_size = Path(audio_path).stat().st_size if Path(audio_path).exists() else 0
+        print(f"[process_video] Extracted audio size: {audio_size} bytes")
+        if audio_size == 0:
+            raise Exception("Audio extraction produced empty file. Video may have incompatible codec.")
         with jobs_lock:
             jobs[job_id]["status"] = "transcribing"
             jobs[job_id]["progress"] = Progress.TRANSCRIBING
@@ -1227,6 +1248,11 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest):
     
     try:
         trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=True)
+        
+        # Verify trimmed file has audio
+        if not has_audio_stream(str(trimmed_path)):
+            print(f"[trim] WARNING: Trimmed file lost audio track, retrying with explicit audio copy")
+            trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=True)
         
         # Update job with trim info
         job["original_video"] = video_path
