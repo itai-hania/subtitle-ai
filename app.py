@@ -10,14 +10,17 @@ import shutil
 import subprocess
 import tempfile
 import re
+import threading
 from pathlib import Path
 from typing import Optional
-from datetime import timedelta
+from datetime import datetime, timedelta
 import time
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import openai
@@ -31,7 +34,32 @@ JOB_ID_PATTERN = re.compile(r'^[a-zA-Z0-9-]{1,36}$')
 
 load_dotenv()
 
-app = FastAPI(title="Video Subtitle Generator")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: start cleanup scheduler on startup."""
+    import asyncio
+    
+    async def periodic_cleanup():
+        while True:
+            await asyncio.sleep(3600)  # Run every hour
+            cleanup_old_jobs()
+    
+    task = asyncio.create_task(periodic_cleanup())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Video Subtitle Generator", lifespan=lifespan)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Directories
 UPLOAD_DIR = Path("uploads")
@@ -56,6 +84,25 @@ WATERMARK_CONFIG = {
 
 # Store job status
 jobs = {}
+jobs_lock = threading.Lock()
+
+# Job expiration
+JOB_TTL = timedelta(hours=24)
+
+
+class Progress:
+    """Named constants for progress percentages."""
+    DOWNLOADING = 5
+    EXTRACTING_AUDIO = 10
+    TRANSCRIBING = 30
+    TRANSLATING = 50
+    EMBEDDING = 70
+    REBURN_START = 10
+    REBURN_SRT = 30
+    REBURN_EMBED = 50
+    NEARLY_DONE = 90
+    COMPLETED = 100
+
 
 # OpenAI client
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -84,6 +131,63 @@ def find_video_path(job_id: str) -> Optional[str]:
                     return str(file)
     
     return None
+
+
+def has_audio_stream(video_path: str) -> bool:
+    """Check if video file has an audio stream."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip() == "audio"
+    except Exception:
+        return False
+
+
+def parse_ffmpeg_error(stderr: str) -> str:
+    """Convert FFmpeg errors to user-friendly messages."""
+    stderr_lower = stderr.lower() if stderr else ""
+    if "no space left on device" in stderr_lower:
+        return "Server disk is full. Please try again later."
+    if "invalid argument" in stderr_lower or "invalid data" in stderr_lower:
+        return "Video file is corrupt or uses an unsupported format."
+    if "codec not currently supported" in stderr_lower or "decoder" in stderr_lower and "not found" in stderr_lower:
+        return "Video codec is not supported. Try converting to MP4 first."
+    if "permission denied" in stderr_lower:
+        return "Permission denied when accessing video file."
+    if "no such file" in stderr_lower:
+        return "Video file not found."
+    if "does not contain any stream" in stderr_lower:
+        return "Video file has no valid streams."
+    return f"Video processing failed: {stderr[:200] if stderr else 'Unknown error'}"
+
+
+def cleanup_old_jobs():
+    """Remove jobs older than JOB_TTL and their associated files."""
+    now = datetime.now()
+    with jobs_lock:
+        expired = [
+            jid for jid, job in jobs.items()
+            if now - job.get("created_at", now) > JOB_TTL
+        ]
+    for jid in expired:
+        # Clean up associated files
+        for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR, OUTPUT_DIR]:
+            for file in search_dir.iterdir():
+                if file.name.startswith(jid):
+                    try:
+                        file.unlink()
+                    except OSError:
+                        pass
+        with jobs_lock:
+            jobs.pop(jid, None)
+    if expired:
+        print(f"Cleaned up {len(expired)} expired job(s)")
 
 
 def format_timestamp(seconds: float) -> str:
@@ -424,7 +528,10 @@ def extract_audio(video_path: str, audio_path: str):
         "-b:a", "64k",       # 64kbps bitrate (speech-optimized, keeps file under 25MB)
         "-y", audio_path
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise Exception(parse_ffmpeg_error(e.stderr.decode() if e.stderr else ""))
 
 
 def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_language: str):
@@ -495,8 +602,9 @@ def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_lan
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr.decode() if e.stderr else 'No error message'}")
-        raise
+        error_msg = e.stderr.decode() if e.stderr else 'No error message'
+        print(f"FFmpeg error: {error_msg}")
+        raise Exception(parse_ffmpeg_error(error_msg))
 
 
 def process_video(job_id: str, video_path: str, target_language: str, use_ollama: bool, ollama_model: str):
@@ -505,8 +613,9 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
     temp_dir = None
     
     try:
-        jobs[job_id]["status"] = "extracting_audio"
-        jobs[job_id]["progress"] = 10
+        with jobs_lock:
+            jobs[job_id]["status"] = "extracting_audio"
+            jobs[job_id]["progress"] = Progress.EXTRACTING_AUDIO
         
         # Create temp directory for this job
         temp_dir = tempfile.mkdtemp()
@@ -514,15 +623,21 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         srt_path = os.path.join(temp_dir, "subtitles.srt")
         srt_path_burning = os.path.join(temp_dir, "subtitles_burning.srt")
         
+        # Check for audio stream before extraction
+        if not has_audio_stream(video_path):
+            raise Exception("Video has no audio track. Cannot generate subtitles.")
+        
         # Step 1: Extract audio
         extract_audio(video_path, audio_path)
-        jobs[job_id]["status"] = "transcribing"
-        jobs[job_id]["progress"] = 30
+        with jobs_lock:
+            jobs[job_id]["status"] = "transcribing"
+            jobs[job_id]["progress"] = Progress.TRANSCRIBING
         
         # Step 2: Transcribe with Whisper
         transcript = transcribe_audio(audio_path)
-        jobs[job_id]["status"] = "translating"
-        jobs[job_id]["progress"] = 50
+        with jobs_lock:
+            jobs[job_id]["status"] = "translating"
+            jobs[job_id]["progress"] = Progress.TRANSLATING
         
         # Step 3: Generate SRT (with translation if needed)
         segments = transcript.segments if hasattr(transcript, 'segments') else transcript.get('segments', [])
@@ -543,8 +658,9 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         else:
             burning_source = srt_path
         
-        jobs[job_id]["status"] = "embedding_subtitles"
-        jobs[job_id]["progress"] = 70
+        with jobs_lock:
+            jobs[job_id]["status"] = "embedding_subtitles"
+            jobs[job_id]["progress"] = Progress.EMBEDDING
         
         # Step 4: Embed subtitles
         output_filename = f"{job_id}_subtitled.mp4"
@@ -555,16 +671,17 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         elapsed_time = time.time() - start_time
         elapsed_formatted = str(timedelta(seconds=int(elapsed_time)))
         
-        jobs[job_id]["status"] = "completed"
-        jobs[job_id]["progress"] = 100
-        jobs[job_id]["output_file"] = output_filename
-        jobs[job_id]["srt_content"] = srt_content
-        jobs[job_id]["original_srt_content"] = original_srt_content
-        jobs[job_id]["elapsed_time"] = elapsed_formatted
-        jobs[job_id]["elapsed_seconds"] = int(elapsed_time)
-        jobs[job_id]["token_usage"] = token_usage
-        jobs[job_id]["subtitles"] = subtitles_data
-        jobs[job_id]["edited"] = False
+        with jobs_lock:
+            jobs[job_id]["status"] = "completed"
+            jobs[job_id]["progress"] = Progress.COMPLETED
+            jobs[job_id]["output_file"] = output_filename
+            jobs[job_id]["srt_content"] = srt_content
+            jobs[job_id]["original_srt_content"] = original_srt_content
+            jobs[job_id]["elapsed_time"] = elapsed_formatted
+            jobs[job_id]["elapsed_seconds"] = int(elapsed_time)
+            jobs[job_id]["token_usage"] = token_usage
+            jobs[job_id]["subtitles"] = subtitles_data
+            jobs[job_id]["edited"] = False
         
         print(f"Job {job_id} completed in {elapsed_formatted}")
         
@@ -586,9 +703,10 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         
     except Exception as e:
         elapsed_time = time.time() - start_time
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
-        jobs[job_id]["elapsed_seconds"] = int(elapsed_time)
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = str(e)
+            jobs[job_id]["elapsed_seconds"] = int(elapsed_time)
         print(f"Error processing video: {e}")
     finally:
         # Always cleanup temp files
@@ -626,7 +744,8 @@ async def upload_video(
         "output_file": None,
         "error": None,
         "original_filename": video.filename,
-        "language": language
+        "language": language,
+        "created_at": datetime.now()
     }
     
     # Start processing in background
@@ -666,7 +785,8 @@ async def upload_video_only(
         "error": None,
         "original_filename": video.filename,
         "video_path": str(video_path),
-        "source_type": "upload"
+        "source_type": "upload",
+        "created_at": datetime.now()
     }
     
     return {"job_id": job_id, "message": "Video uploaded successfully."}
@@ -914,13 +1034,14 @@ async def get_video_info_endpoint(url: str = Query(..., description="YouTube or 
 def download_video_task(job_id: str, url: str, quality: str):
     """Background task for downloading video."""
     try:
-        jobs[job_id]["status"] = "downloading"
-        jobs[job_id]["progress"] = 5
+        with jobs_lock:
+            jobs[job_id]["status"] = "downloading"
+            jobs[job_id]["progress"] = Progress.DOWNLOADING
         
         def progress_callback(percent, status):
-            # Scale download progress to 0-90%
-            jobs[job_id]["progress"] = min(int(percent * 0.9), 90)
-            jobs[job_id]["download_status"] = status
+            with jobs_lock:
+                jobs[job_id]["progress"] = min(int(percent * 0.9), 90)
+                jobs[job_id]["download_status"] = status
         
         output_path = download_video_from_url(
             url=url,
@@ -930,14 +1051,16 @@ def download_video_task(job_id: str, url: str, quality: str):
             progress_callback=progress_callback
         )
         
-        jobs[job_id]["status"] = "downloaded"
-        jobs[job_id]["progress"] = 100
-        jobs[job_id]["video_path"] = str(output_path)
-        jobs[job_id]["download_status"] = "complete"
+        with jobs_lock:
+            jobs[job_id]["status"] = "downloaded"
+            jobs[job_id]["progress"] = Progress.COMPLETED
+            jobs[job_id]["video_path"] = str(output_path)
+            jobs[job_id]["download_status"] = "complete"
         
     except Exception as e:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = str(e)
 
 
 @app.post("/download-url")
@@ -986,7 +1109,8 @@ async def download_from_url(
             "video_id": info.video_id
         },
         "video_path": None,
-        "download_status": "pending"
+        "download_status": "pending",
+        "created_at": datetime.now()
     }
     
     # Start download in background
@@ -1230,9 +1354,10 @@ def reburn_video_task(job_id: str):
     """Background task to re-burn subtitles into video."""
     temp_dir = None
     try:
-        job = jobs[job_id]
-        job["status"] = "reburning"
-        job["progress"] = 10
+        with jobs_lock:
+            job = jobs[job_id]
+            job["status"] = "reburning"
+            job["progress"] = Progress.REBURN_START
         
         # Use trimmed video if available, otherwise find the original
         trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
@@ -1244,7 +1369,8 @@ def reburn_video_task(job_id: str):
         if not video_path or not Path(video_path).exists():
             raise Exception("Video file not found")
         
-        job["progress"] = 30
+        with jobs_lock:
+            job["progress"] = Progress.REBURN_SRT
         
         # Create temp SRT file from updated subtitles
         temp_dir = tempfile.mkdtemp()
@@ -1260,7 +1386,8 @@ def reburn_video_task(job_id: str):
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
         
-        job["progress"] = 50
+        with jobs_lock:
+            job["progress"] = Progress.REBURN_EMBED
         
         # Re-embed subtitles
         output_filename = f"{job_id}_edited.mp4"
@@ -1268,16 +1395,15 @@ def reburn_video_task(job_id: str):
         
         embed_subtitles(video_path, srt_path, str(output_path), target_language)
         
-        job["progress"] = 90
-        
-        # Update job
-        job["status"] = "completed"
-        job["progress"] = 100
-        job["output_file"] = output_filename
+        with jobs_lock:
+            job["status"] = "completed"
+            job["progress"] = Progress.COMPLETED
+            job["output_file"] = output_filename
         
     except Exception as e:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = str(e)
     finally:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)

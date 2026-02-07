@@ -529,25 +529,23 @@ function handleTrimDrag(e) {
     updateTrimUI();
 }
 
-trimHandleStart.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    draggingHandle = 'start';
-    document.addEventListener('mousemove', handleTrimDrag);
-    document.addEventListener('mouseup', () => {
-        draggingHandle = null;
-        document.removeEventListener('mousemove', handleTrimDrag);
-    }, { once: true });
-});
+function stopTrimDrag() {
+    draggingHandle = null;
+    document.removeEventListener('mousemove', handleTrimDrag);
+    document.removeEventListener('mouseup', stopTrimDrag);
+}
 
-trimHandleEnd.addEventListener('mousedown', (e) => {
+function startTrimDrag(handle, e) {
     e.preventDefault();
-    draggingHandle = 'end';
+    // Clean up any previous drag listeners
+    stopTrimDrag();
+    draggingHandle = handle;
     document.addEventListener('mousemove', handleTrimDrag);
-    document.addEventListener('mouseup', () => {
-        draggingHandle = null;
-        document.removeEventListener('mousemove', handleTrimDrag);
-    }, { once: true });
-});
+    document.addEventListener('mouseup', stopTrimDrag);
+}
+
+trimHandleStart.addEventListener('mousedown', (e) => startTrimDrag('start', e));
+trimHandleEnd.addEventListener('mousedown', (e) => startTrimDrag('end', e));
 
 // Sync video with trim handles
 trimVideo.addEventListener('loadedmetadata', () => {
@@ -791,11 +789,18 @@ function updateProgress(percent, message) {
 }
 
 function updateSteps(currentStepName) {
+    const stepIds = {
+        'upload': 'step-upload',
+        'extract': 'step-extract',
+        'transcribe': 'step-transcribe',
+        'translate': 'step-translate-progress',
+        'embed': 'step-embed'
+    };
     const steps = ['upload', 'extract', 'transcribe', 'translate', 'embed'];
     const currentIndex = steps.indexOf(currentStepName);
     
     steps.forEach((step, index) => {
-        const stepEl = document.getElementById(`step-${step}`) || document.getElementById(`step-${step}-progress`);
+        const stepEl = document.getElementById(stepIds[step]);
         if (stepEl) {
             stepEl.classList.remove('active', 'completed');
             
