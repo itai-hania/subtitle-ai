@@ -154,10 +154,17 @@
                         <div class="trim-playhead" id="trim-playhead"></div>
                     </div>
                     <div class="trim-times">
-                        <span id="trim-start-time" class="trim-time-badge">00:00.0</span>
-                        <span id="trim-duration">Duration: --:--</span>
-                        <span id="trim-end-time" class="trim-time-badge">00:00.0</span>
+                        <div class="trim-time-input-group">
+                            <label>Start</label>
+                            <input type="text" id="trim-start-time" class="trim-time-input" value="00:00.0">
+                        </div>
+                        <span id="trim-duration" class="trim-duration-label">Duration: --:--</span>
+                        <div class="trim-time-input-group">
+                            <label>End</label>
+                            <input type="text" id="trim-end-time" class="trim-time-input" value="00:00.0">
+                        </div>
                     </div>
+                    <p class="trim-hint">Drag handles to trim. Use ← → arrow keys on handles for fine control (0.1s steps). Click timeline to seek.</p>
                 </div>
             </div>
 

@@ -506,8 +506,8 @@ function updateTrimUI() {
     trimRange.style.left = `${startPercent}%`;
     trimRange.style.right = `${100 - endPercent}%`;
     
-    trimStartTime.textContent = formatTimePrecise(trimStart);
-    trimEndTime.textContent = formatTimePrecise(trimEnd);
+    trimStartTime.value = formatTimePrecise(trimStart);
+    trimEndTime.value = formatTimePrecise(trimEnd);
     trimDurationEl.textContent = `Duration: ${formatTimePrecise(trimEnd - trimStart)}`;
 }
 
@@ -519,24 +519,28 @@ function formatTimePrecise(seconds) {
 
 // Trim slider interaction
 let draggingHandle = null;
+let dragStartX = 0;
+let dragStartTime = 0;
 
 function handleTrimDrag(e) {
     if (!draggingHandle) return;
     
     const rect = trimSlider.getBoundingClientRect();
-    let percent = (e.clientX - rect.left) / rect.width;
+    const sliderWidth = rect.width;
+    
+    // Direct pixel-to-time mapping for precise control
+    let percent = (e.clientX - rect.left) / sliderWidth;
     percent = Math.max(0, Math.min(1, percent));
-    const time = percent * videoDuration;
+    let time = percent * videoDuration;
+    
+    // Round to 0.1s for clean values
+    time = Math.round(time * 10) / 10;
     
     if (draggingHandle === 'start') {
-        trimStart = Math.min(time, trimEnd - 0.1);
-        trimStart = Math.max(0, trimStart);
-        // Seek video to start handle position
+        trimStart = Math.max(0, Math.min(time, trimEnd - 0.1));
         trimVideo.currentTime = trimStart;
     } else {
-        trimEnd = Math.max(time, trimStart + 0.1);
-        trimEnd = Math.min(videoDuration, trimEnd);
-        // Seek video to end handle position
+        trimEnd = Math.min(videoDuration, Math.max(time, trimStart + 0.1));
         trimVideo.currentTime = trimEnd;
     }
     
@@ -564,11 +568,71 @@ trimHandleEnd.addEventListener('mousedown', (e) => startTrimDrag('end', e));
 // Click on slider track to seek
 trimSlider.addEventListener('click', (e) => {
     if (e.target === trimHandleStart || e.target === trimHandleEnd) return;
+    if (e.target.closest('.trim-handle')) return;
     const rect = trimSlider.getBoundingClientRect();
     let percent = (e.clientX - rect.left) / rect.width;
     percent = Math.max(0, Math.min(1, percent));
     const time = percent * videoDuration;
     trimVideo.currentTime = time;
+});
+
+// Make handles focusable for keyboard control
+trimHandleStart.setAttribute('tabindex', '0');
+trimHandleEnd.setAttribute('tabindex', '0');
+
+function handleTrimKeydown(handle, e) {
+    const step = e.shiftKey ? 1.0 : 0.1;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        const delta = e.key === 'ArrowRight' ? step : -step;
+        if (handle === 'start') {
+            trimStart = Math.max(0, Math.min(trimStart + delta, trimEnd - 0.1));
+            trimVideo.currentTime = trimStart;
+        } else {
+            trimEnd = Math.min(videoDuration, Math.max(trimEnd + delta, trimStart + 0.1));
+            trimVideo.currentTime = trimEnd;
+        }
+        // Round to 0.1s
+        trimStart = Math.round(trimStart * 10) / 10;
+        trimEnd = Math.round(trimEnd * 10) / 10;
+        updateTrimUI();
+    }
+}
+
+trimHandleStart.addEventListener('keydown', (e) => handleTrimKeydown('start', e));
+trimHandleEnd.addEventListener('keydown', (e) => handleTrimKeydown('end', e));
+
+// Parse time input: accepts "MM:SS.s" or just seconds
+function parseTimeInput(value) {
+    value = value.trim();
+    const match = value.match(/^(\d+):(\d+\.?\d*)$/);
+    if (match) {
+        return parseInt(match[1]) * 60 + parseFloat(match[2]);
+    }
+    const num = parseFloat(value);
+    return isNaN(num) ? null : num;
+}
+
+trimStartTime.addEventListener('change', () => {
+    const time = parseTimeInput(trimStartTime.value);
+    if (time !== null && time >= 0 && time < trimEnd) {
+        trimStart = Math.round(time * 10) / 10;
+        trimVideo.currentTime = trimStart;
+        updateTrimUI();
+    } else {
+        trimStartTime.value = formatTimePrecise(trimStart);
+    }
+});
+
+trimEndTime.addEventListener('change', () => {
+    const time = parseTimeInput(trimEndTime.value);
+    if (time !== null && time > trimStart && time <= videoDuration) {
+        trimEnd = Math.round(time * 10) / 10;
+        trimVideo.currentTime = trimEnd;
+        updateTrimUI();
+    } else {
+        trimEndTime.value = formatTimePrecise(trimEnd);
+    }
 });
 
 // Sync video with trim handles

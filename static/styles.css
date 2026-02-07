@@ -1096,8 +1096,9 @@ body {
 }
 
 .trim-slider-container {
-    padding: 0 10px;
+    padding: 0;
     position: relative;
+    max-width: 100%;
 }
 
 .trim-thumbnails {
@@ -1158,6 +1159,12 @@ body {
     background: var(--accent-hover);
 }
 
+.trim-handle:focus {
+    outline: 2px solid #fff;
+    outline-offset: 2px;
+    background: var(--accent-hover);
+}
+
 .trim-handle-line {
     width: 2px;
     height: 20px;
@@ -1191,24 +1198,53 @@ body {
     display: flex;
     justify-content: space-between;
     margin-top: 12px;
-    font-size: 0.85rem;
-    color: var(--text-secondary);
     align-items: center;
 }
 
-.trim-time-badge {
-    background: rgba(99, 102, 241, 0.15);
+.trim-time-input-group {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+
+.trim-time-input-group label {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.trim-time-input {
+    background: rgba(99, 102, 241, 0.1);
+    border: 1px solid rgba(99, 102, 241, 0.3);
     color: var(--accent-primary);
-    padding: 3px 10px;
+    padding: 5px 10px;
     border-radius: var(--radius-sm);
     font-family: 'Courier New', monospace;
     font-weight: 600;
+    font-size: 0.95rem;
+    width: 90px;
+    text-align: center;
+}
+
+.trim-time-input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+.trim-duration-label {
+    color: var(--accent-primary);
+    font-weight: 500;
     font-size: 0.9rem;
 }
 
-#trim-duration {
-    color: var(--accent-primary);
-    font-weight: 500;
+.trim-hint {
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 8px;
 }
 
 .download-progress {
