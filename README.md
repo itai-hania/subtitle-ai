@@ -46,8 +46,10 @@ Upload a video, get back a subtitled version with accurate translations — all 
 
 4. **Set up environment variables**
    ```bash
-   cp .env.example .env
-   # Edit .env and add your OpenAI API key
+   # Create a .env file with your keys:
+   # OPENAI_API_KEY=your_openai_api_key_here
+   # X_USERNAME=your_twitter_username (optional)
+   # X_PASSWORD=your_twitter_password (optional)
    ```
 
 5. **Run the application**
@@ -108,7 +110,7 @@ The app uses `gpt-5-nano` with optimized settings:
 subtitle-ai/
 ├── app.py              # FastAPI backend application
 ├── requirements.txt    # Python dependencies
-├── .env.example        # Environment variables template
+├── .env                # Environment variables (not tracked by git)
 ├── .gitignore          # Git ignore rules
 ├── static/
 │   ├── index.html      # Web UI
