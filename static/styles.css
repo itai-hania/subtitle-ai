@@ -1097,58 +1097,113 @@ body {
 
 .trim-slider-container {
     padding: 0 10px;
+    position: relative;
+}
+
+.trim-thumbnails {
+    display: flex;
+    gap: 1px;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    margin-bottom: 4px;
+    height: 56px;
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.trim-thumbnail {
+    flex: 1;
+    height: 56px;
+    object-fit: cover;
+    display: block;
 }
 
 .trim-slider {
     position: relative;
-    height: 40px;
-    background: rgba(255, 255, 255, 0.1);
+    height: 56px;
+    background: rgba(0, 0, 0, 0.5);
     border-radius: var(--radius-sm);
     cursor: pointer;
+    margin-top: -60px;
+    z-index: 2;
 }
 
 .trim-range {
     position: absolute;
     top: 0;
     bottom: 0;
-    background: rgba(99, 102, 241, 0.4);
-    border-radius: var(--radius-sm);
+    background: transparent;
+    border-top: 3px solid var(--accent-primary);
+    border-bottom: 3px solid var(--accent-primary);
     left: 0;
     right: 0;
+    z-index: 1;
 }
 
 .trim-handle {
     position: absolute;
-    top: -4px;
-    bottom: -4px;
-    width: 12px;
+    top: 0;
+    bottom: 0;
+    width: 16px;
     background: var(--accent-primary);
-    border-radius: 4px;
     cursor: ew-resize;
     z-index: 10;
-    transition: transform 0.1s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s;
 }
 
-.trim-handle:hover {
-    transform: scaleX(1.2);
+.trim-handle:hover,
+.trim-handle:active {
+    background: var(--accent-hover);
+}
+
+.trim-handle-line {
+    width: 2px;
+    height: 20px;
+    background: rgba(255, 255, 255, 0.8);
+    border-radius: 1px;
 }
 
 .trim-handle-start {
     left: 0;
-    border-radius: 4px 0 0 4px;
+    border-radius: 6px 0 0 6px;
 }
 
 .trim-handle-end {
     right: 0;
-    border-radius: 0 4px 4px 0;
+    border-radius: 0 6px 6px 0;
+}
+
+.trim-playhead {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: #fff;
+    z-index: 5;
+    left: 0;
+    pointer-events: none;
+    box-shadow: 0 0 4px rgba(0, 0, 0, 0.5);
 }
 
 .trim-times {
     display: flex;
     justify-content: space-between;
-    margin-top: 10px;
+    margin-top: 12px;
     font-size: 0.85rem;
     color: var(--text-secondary);
+    align-items: center;
+}
+
+.trim-time-badge {
+    background: rgba(99, 102, 241, 0.15);
+    color: var(--accent-primary);
+    padding: 3px 10px;
+    border-radius: var(--radius-sm);
+    font-family: 'Courier New', monospace;
+    font-weight: 600;
+    font-size: 0.9rem;
 }
 
 #trim-duration {

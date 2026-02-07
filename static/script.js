@@ -57,6 +57,8 @@ const trimHandleEnd = document.getElementById('trim-handle-end');
 const trimStartTime = document.getElementById('trim-start-time');
 const trimEndTime = document.getElementById('trim-end-time');
 const trimDurationEl = document.getElementById('trim-duration');
+const trimThumbnails = document.getElementById('trim-thumbnails');
+const trimPlayhead = document.getElementById('trim-playhead');
 const downloadProgress = document.getElementById('download-progress');
 const downloadProgressBar = document.getElementById('download-progress-bar');
 const downloadStatusText = document.getElementById('download-status-text');
@@ -504,9 +506,15 @@ function updateTrimUI() {
     trimRange.style.left = `${startPercent}%`;
     trimRange.style.right = `${100 - endPercent}%`;
     
-    trimStartTime.textContent = formatTime(trimStart);
-    trimEndTime.textContent = formatTime(trimEnd);
-    trimDurationEl.textContent = `Duration: ${formatTime(trimEnd - trimStart)}`;
+    trimStartTime.textContent = formatTimePrecise(trimStart);
+    trimEndTime.textContent = formatTimePrecise(trimEnd);
+    trimDurationEl.textContent = `Duration: ${formatTimePrecise(trimEnd - trimStart)}`;
+}
+
+function formatTimePrecise(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toFixed(1).padStart(4, '0')}`;
 }
 
 // Trim slider interaction
@@ -521,9 +529,15 @@ function handleTrimDrag(e) {
     const time = percent * videoDuration;
     
     if (draggingHandle === 'start') {
-        trimStart = Math.min(time, trimEnd - 1);
+        trimStart = Math.min(time, trimEnd - 0.1);
+        trimStart = Math.max(0, trimStart);
+        // Seek video to start handle position
+        trimVideo.currentTime = trimStart;
     } else {
-        trimEnd = Math.max(time, trimStart + 1);
+        trimEnd = Math.max(time, trimStart + 0.1);
+        trimEnd = Math.min(videoDuration, trimEnd);
+        // Seek video to end handle position
+        trimVideo.currentTime = trimEnd;
     }
     
     updateTrimUI();
@@ -537,8 +551,8 @@ function stopTrimDrag() {
 
 function startTrimDrag(handle, e) {
     e.preventDefault();
-    // Clean up any previous drag listeners
     stopTrimDrag();
+    trimVideo.pause();
     draggingHandle = handle;
     document.addEventListener('mousemove', handleTrimDrag);
     document.addEventListener('mouseup', stopTrimDrag);
@@ -547,6 +561,16 @@ function startTrimDrag(handle, e) {
 trimHandleStart.addEventListener('mousedown', (e) => startTrimDrag('start', e));
 trimHandleEnd.addEventListener('mousedown', (e) => startTrimDrag('end', e));
 
+// Click on slider track to seek
+trimSlider.addEventListener('click', (e) => {
+    if (e.target === trimHandleStart || e.target === trimHandleEnd) return;
+    const rect = trimSlider.getBoundingClientRect();
+    let percent = (e.clientX - rect.left) / rect.width;
+    percent = Math.max(0, Math.min(1, percent));
+    const time = percent * videoDuration;
+    trimVideo.currentTime = time;
+});
+
 // Sync video with trim handles
 trimVideo.addEventListener('loadedmetadata', () => {
     if (!videoDuration || isNaN(trimVideo.duration)) {
@@ -554,7 +578,74 @@ trimVideo.addEventListener('loadedmetadata', () => {
         trimEnd = videoDuration;
         updateTrimUI();
     }
+    generateThumbnails();
 });
+
+// Update playhead position during video playback
+trimVideo.addEventListener('timeupdate', () => {
+    if (videoDuration > 0) {
+        const percent = (trimVideo.currentTime / videoDuration) * 100;
+        trimPlayhead.style.left = `${percent}%`;
+    }
+});
+
+function generateThumbnails() {
+    if (!trimVideo.duration || trimVideo.duration === Infinity) return;
+    
+    trimThumbnails.innerHTML = '';
+    const count = 15;
+    const interval = trimVideo.duration / count;
+    let generated = 0;
+    
+    // Create a hidden video element for thumbnail extraction
+    const thumbVideo = document.createElement('video');
+    thumbVideo.src = trimVideo.src;
+    thumbVideo.crossOrigin = 'anonymous';
+    thumbVideo.muted = true;
+    thumbVideo.preload = 'auto';
+    
+    // Create placeholder images first
+    for (let i = 0; i < count; i++) {
+        const canvas = document.createElement('canvas');
+        canvas.className = 'trim-thumbnail';
+        canvas.width = 120;
+        canvas.height = 68;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#1a1a2e';
+        ctx.fillRect(0, 0, 120, 68);
+        trimThumbnails.appendChild(canvas);
+    }
+    
+    thumbVideo.addEventListener('loadeddata', () => {
+        captureFrame(0);
+    });
+    
+    function captureFrame(index) {
+        if (index >= count) {
+            thumbVideo.remove();
+            return;
+        }
+        const time = index * interval;
+        thumbVideo.currentTime = time;
+    }
+    
+    thumbVideo.addEventListener('seeked', () => {
+        const index = Math.round(thumbVideo.currentTime / interval);
+        if (index < count) {
+            const canvas = trimThumbnails.children[index];
+            if (canvas) {
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(thumbVideo, 0, 0, 120, 68);
+            }
+        }
+        generated++;
+        if (generated < count) {
+            captureFrame(generated);
+        } else {
+            thumbVideo.remove();
+        }
+    });
+}
 
 trimVideo.addEventListener('error', () => {
     showError('Failed to load video preview. The file may be corrupt or unsupported.');
