@@ -115,6 +115,16 @@ const retryBtn = document.getElementById('retry-btn');
 // ============================================
 
 function goToStep(step) {
+    // Pause all videos when leaving any step
+    trimVideo.pause();
+    editorVideo.pause();
+    
+    // Clear trim video source when leaving trim step to prevent stale error events
+    if (currentStep === 2 && step !== 2) {
+        trimVideo.removeAttribute('src');
+        trimVideo.load();
+    }
+    
     currentStep = step;
     clearAllIntervals();
     
@@ -712,7 +722,9 @@ function generateThumbnails() {
 }
 
 trimVideo.addEventListener('error', () => {
-    showError('Failed to load video preview. The file may be corrupt or unsupported.');
+    if (currentStep === 2) {
+        showError('Failed to load video preview. The file may be corrupt or unsupported.');
+    }
 });
 
 editorVideo.addEventListener('error', () => {
