@@ -14,12 +14,16 @@ from typing import Optional
 from datetime import timedelta
 import time
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
 import openai
 import ollama
+
+from downloader import detect_source, get_video_info, download_video as download_video_from_url, is_valid_url, VideoSource
+from trimmer import get_video_duration, trim_video, get_video_info as get_video_file_info
 
 load_dotenv()
 
@@ -28,8 +32,10 @@ app = FastAPI(title="Video Subtitle Generator")
 # Directories
 UPLOAD_DIR = Path("uploads")
 OUTPUT_DIR = Path("outputs")
+DOWNLOAD_DIR = Path("downloads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # Watermark configuration
 WATERMARK_CONFIG = {
@@ -314,8 +320,9 @@ def generate_srt(segments: list, target_language: str, use_ollama: bool = False,
     else:
         translated_texts = texts
     
-    # Build translated SRT content
+    # Build translated SRT content and structured segment data
     srt_content = []
+    subtitles_data = []
     for i, (seg, translated_text) in enumerate(zip(segment_data, translated_texts), 1):
         start_time = format_timestamp(seg['start'])
         end_time = format_timestamp(seg['end'])
@@ -324,8 +331,17 @@ def generate_srt(segments: list, target_language: str, use_ollama: bool = False,
         srt_content.append(f"{start_time} --> {end_time}")
         srt_content.append(translated_text)
         srt_content.append("")  # Empty line between entries
+        
+        # Store structured subtitle data for editing
+        subtitles_data.append({
+            "id": i,
+            "start": seg['start'],
+            "end": seg['end'],
+            "text": translated_text,
+            "original_text": seg['text']
+        })
     
-    return "\n".join(srt_content), original_srt, total_tokens
+    return "\n".join(srt_content), original_srt, total_tokens, subtitles_data
 
 
 def wrap_rtl(text: str) -> str:
@@ -354,6 +370,19 @@ def process_srt_for_rtl(srt_content: str) -> str:
             new_blocks.append(block)
             
     return "\n\n".join(new_blocks)
+
+
+def subtitles_to_srt(subtitles: list) -> str:
+    """Convert subtitles list back to SRT format."""
+    srt_content = []
+    for sub in subtitles:
+        start_time = format_timestamp(sub['start'])
+        end_time = format_timestamp(sub['end'])
+        srt_content.append(f"{sub['id']}")
+        srt_content.append(f"{start_time} --> {end_time}")
+        srt_content.append(sub['text'])
+        srt_content.append("")
+    return "\n".join(srt_content)
 
 
 def extract_audio(video_path: str, audio_path: str):
@@ -467,7 +496,7 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         
         # Step 3: Generate SRT (with translation if needed)
         segments = transcript.segments if hasattr(transcript, 'segments') else transcript.get('segments', [])
-        srt_content, original_srt_content, token_usage = generate_srt(segments, target_language, use_ollama, ollama_model)
+        srt_content, original_srt_content, token_usage, subtitles_data = generate_srt(segments, target_language, use_ollama, ollama_model)
         
         # Save standard SRT for download
         with open(srt_path, "w", encoding="utf-8") as f:
@@ -502,6 +531,8 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         jobs[job_id]["elapsed_time"] = elapsed_formatted
         jobs[job_id]["elapsed_seconds"] = int(elapsed_time)
         jobs[job_id]["token_usage"] = token_usage
+        jobs[job_id]["subtitles"] = subtitles_data
+        jobs[job_id]["edited"] = False
         
         print(f"Job {job_id} completed in {elapsed_formatted}")
         
@@ -738,6 +769,476 @@ async def get_ollama_models():
         return {"models": [m['name'] for m in models.get('models', [])]}
     except Exception as e:
         return {"models": [], "error": str(e)}
+
+
+# ============================================
+# Video Download Endpoints
+# ============================================
+
+class DownloadRequest(BaseModel):
+    url: str
+    quality: str = "720p"
+
+
+@app.get("/video-info")
+async def get_video_info_endpoint(url: str = Query(..., description="YouTube or X/Twitter URL")):
+    """Get video metadata without downloading."""
+    if not url or not url.strip():
+        raise HTTPException(status_code=400, detail="URL is required")
+    
+    if not is_valid_url(url):
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid URL. Please provide a YouTube or X/Twitter video link."
+        )
+    
+    try:
+        info = get_video_info(url)
+        return {
+            "title": info.title,
+            "duration": info.duration,
+            "thumbnail": info.thumbnail,
+            "source": info.source.value,
+            "video_id": info.video_id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def download_video_task(job_id: str, url: str, quality: str):
+    """Background task for downloading video."""
+    try:
+        jobs[job_id]["status"] = "downloading"
+        jobs[job_id]["progress"] = 5
+        
+        def progress_callback(percent, status):
+            # Scale download progress to 0-90%
+            jobs[job_id]["progress"] = min(int(percent * 0.9), 90)
+            jobs[job_id]["download_status"] = status
+        
+        output_path = download_video_from_url(
+            url=url,
+            output_dir=DOWNLOAD_DIR,
+            job_id=job_id,
+            quality=quality,
+            progress_callback=progress_callback
+        )
+        
+        jobs[job_id]["status"] = "downloaded"
+        jobs[job_id]["progress"] = 100
+        jobs[job_id]["video_path"] = str(output_path)
+        jobs[job_id]["download_status"] = "complete"
+        
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
+
+
+@app.post("/download-url")
+async def download_from_url(
+    background_tasks: BackgroundTasks,
+    request: DownloadRequest
+):
+    """Start downloading video from URL."""
+    url = request.url.strip()
+    quality = request.quality
+    
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+    
+    if not is_valid_url(url):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid URL. Please provide a YouTube or X/Twitter video link."
+        )
+    
+    # Validate quality
+    if quality not in ["720p", "1080p", "best"]:
+        quality = "720p"
+    
+    # Get video info first
+    try:
+        info = get_video_info(url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())[:8]
+    
+    # Initialize job status with enhanced fields
+    jobs[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "output_file": None,
+        "error": None,
+        "source_type": info.source.value,
+        "source_url": url,
+        "video_info": {
+            "title": info.title,
+            "duration": info.duration,
+            "thumbnail": info.thumbnail,
+            "video_id": info.video_id
+        },
+        "video_path": None,
+        "download_status": "pending"
+    }
+    
+    # Start download in background
+    background_tasks.add_task(download_video_task, job_id, url, quality)
+    
+    return {
+        "job_id": job_id,
+        "message": "Download started",
+        "video_info": jobs[job_id]["video_info"]
+    }
+
+
+@app.get("/download-status/{job_id}")
+async def get_download_status(job_id: str):
+    """Get download progress status."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    return {
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "download_status": job.get("download_status"),
+        "error": job.get("error"),
+        "video_info": job.get("video_info"),
+        "video_path": job.get("video_path")
+    }
+
+
+@app.get("/video-preview/{job_id}")
+async def preview_video(job_id: str):
+    """Stream video for HTML5 player preview."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    video_path = job.get("video_path")
+    
+    if not video_path:
+        # Check if this is an upload job
+        for ext in ['mp4', 'mov', 'avi', 'mkv']:
+            for file in UPLOAD_DIR.iterdir():
+                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
+                    video_path = str(file)
+                    break
+    
+    if not video_path or not Path(video_path).exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    return FileResponse(
+        path=video_path,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache"
+        }
+    )
+
+
+# ============================================
+# Video Trimming Endpoints
+# ============================================
+
+class TrimRequest(BaseModel):
+    start_time: float
+    end_time: float
+
+
+@app.get("/video-duration/{job_id}")
+async def get_video_duration_endpoint(job_id: str):
+    """Get video duration for trimming UI."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    video_path = job.get("video_path")
+    
+    # Also check for uploaded files
+    if not video_path:
+        for ext in ['mp4', 'mov', 'avi', 'mkv']:
+            for file in UPLOAD_DIR.iterdir():
+                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
+                    video_path = str(file)
+                    break
+    
+    if not video_path or not Path(video_path).exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    try:
+        duration = get_video_duration(video_path)
+        file_info = get_video_file_info(video_path)
+        return {
+            "duration": duration,
+            "width": file_info.get("width"),
+            "height": file_info.get("height"),
+            "fps": file_info.get("fps"),
+            "size_bytes": file_info.get("size_bytes")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/trim/{job_id}")
+async def trim_video_endpoint(job_id: str, request: TrimRequest):
+    """Trim video to specified time range."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    video_path = job.get("video_path")
+    
+    # Also check for uploaded files
+    if not video_path:
+        for ext in ['mp4', 'mov', 'avi', 'mkv']:
+            for file in UPLOAD_DIR.iterdir():
+                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
+                    video_path = str(file)
+                    break
+    
+    if not video_path or not Path(video_path).exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    start_time = request.start_time
+    end_time = request.end_time
+    
+    # Validate times
+    try:
+        duration = get_video_duration(video_path)
+        if start_time < 0:
+            start_time = 0
+        if end_time > duration:
+            end_time = duration
+        if end_time <= start_time:
+            raise HTTPException(status_code=400, detail="End time must be greater than start time")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    # Create trimmed file path
+    trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
+    
+    try:
+        trim_video(video_path, str(trimmed_path), start_time, end_time)
+        
+        # Update job with trim info
+        job["original_video"] = video_path
+        job["video_path"] = str(trimmed_path)
+        job["trim_start"] = start_time
+        job["trim_end"] = end_time
+        job["trimmed"] = True
+        
+        return {
+            "message": "Video trimmed successfully",
+            "trimmed_path": str(trimmed_path),
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration": end_time - start_time
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/skip-trim/{job_id}")
+async def skip_trim(job_id: str):
+    """Skip trimming and use original video."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    video_path = job.get("video_path")
+    
+    if not video_path:
+        for ext in ['mp4', 'mov', 'avi', 'mkv']:
+            for file in UPLOAD_DIR.iterdir():
+                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
+                    video_path = str(file)
+                    job["video_path"] = video_path
+                    break
+    
+    if not video_path or not Path(video_path).exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    try:
+        duration = get_video_duration(video_path)
+        job["trim_start"] = 0
+        job["trim_end"] = duration
+        job["trimmed"] = False
+        
+        return {
+            "message": "Trimming skipped",
+            "video_path": video_path,
+            "duration": duration
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================
+# Subtitle Editing Endpoints
+# ============================================
+
+class SubtitleUpdate(BaseModel):
+    id: int
+    text: str
+
+
+class SubtitlesUpdateRequest(BaseModel):
+    subtitles: list[SubtitleUpdate]
+
+
+@app.get("/subtitles/{job_id}")
+async def get_subtitles(job_id: str):
+    """Get subtitle segments for editing."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Job is not completed yet")
+    
+    subtitles = job.get("subtitles", [])
+    if not subtitles:
+        raise HTTPException(status_code=404, detail="No subtitles found for this job")
+    
+    return {
+        "subtitles": subtitles,
+        "language": job.get("language"),
+        "edited": job.get("edited", False),
+        "count": len(subtitles)
+    }
+
+
+@app.put("/subtitles/{job_id}")
+async def update_subtitles(job_id: str, request: SubtitlesUpdateRequest):
+    """Update subtitle text (for editing before re-burn)."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Job is not completed yet")
+    
+    subtitles = job.get("subtitles", [])
+    if not subtitles:
+        raise HTTPException(status_code=404, detail="No subtitles found for this job")
+    
+    # Create a lookup for quick updates
+    subtitles_dict = {s["id"]: s for s in subtitles}
+    
+    updated_count = 0
+    for update in request.subtitles:
+        if update.id in subtitles_dict:
+            subtitles_dict[update.id]["text"] = update.text
+            updated_count += 1
+    
+    # Rebuild subtitles list maintaining order
+    job["subtitles"] = [subtitles_dict[s["id"]] for s in subtitles]
+    job["edited"] = True
+    
+    # Rebuild SRT content from updated subtitles
+    job["srt_content"] = subtitles_to_srt(job["subtitles"])
+    
+    return {
+        "message": f"Updated {updated_count} subtitle(s)",
+        "updated_count": updated_count,
+        "total_count": len(subtitles)
+    }
+
+
+def reburn_video_task(job_id: str):
+    """Background task to re-burn subtitles into video."""
+    try:
+        job = jobs[job_id]
+        job["status"] = "reburing"
+        job["progress"] = 10
+        
+        # Get video path (use original if trimmed, otherwise uploaded)
+        video_path = job.get("original_video") or job.get("video_path")
+        
+        # If no original_video, find uploaded file
+        if not video_path:
+            for ext in ['mp4', 'mov', 'avi', 'mkv']:
+                for file in UPLOAD_DIR.iterdir():
+                    if file.name.startswith(job_id) and not "_trimmed" in file.name and file.suffix.lower() == f'.{ext}':
+                        video_path = str(file)
+                        break
+        
+        # Use trimmed if available
+        trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
+        if trimmed_path.exists():
+            video_path = str(trimmed_path)
+        
+        if not video_path or not Path(video_path).exists():
+            raise Exception("Video file not found")
+        
+        job["progress"] = 30
+        
+        # Create temp SRT file from updated subtitles
+        temp_dir = tempfile.mkdtemp()
+        srt_path = os.path.join(temp_dir, "subtitles.srt")
+        
+        srt_content = subtitles_to_srt(job["subtitles"])
+        
+        # Apply RTL markers if Hebrew
+        target_language = job.get("language", "english")
+        if target_language.lower() == "hebrew":
+            srt_content = process_srt_for_rtl(srt_content)
+        
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+        
+        job["progress"] = 50
+        
+        # Re-embed subtitles
+        output_filename = f"{job_id}_edited.mp4"
+        output_path = OUTPUT_DIR / output_filename
+        
+        embed_subtitles(video_path, srt_path, str(output_path), target_language)
+        
+        job["progress"] = 90
+        
+        # Update job
+        job["status"] = "completed"
+        job["progress"] = 100
+        job["output_file"] = output_filename
+        
+        # Cleanup temp files
+        os.remove(srt_path)
+        os.rmdir(temp_dir)
+        
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
+
+
+@app.post("/reburn/{job_id}")
+async def reburn_video(job_id: str, background_tasks: BackgroundTasks):
+    """Re-embed edited subtitles into video."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    
+    if job.get("status") not in ["completed"]:
+        raise HTTPException(status_code=400, detail="Job must be completed before re-burning")
+    
+    subtitles = job.get("subtitles", [])
+    if not subtitles:
+        raise HTTPException(status_code=400, detail="No subtitles to burn")
+    
+    # Start re-burn in background
+    background_tasks.add_task(reburn_video_task, job_id)
+    
+    return {
+        "message": "Re-burning started",
+        "job_id": job_id
+    }
 
 
 # Mount static files

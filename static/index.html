@@ -30,7 +30,39 @@
             <p class="tagline">Transform your videos with AI-powered subtitles in seconds</p>
         </header>
 
-        <div class="card main-card" id="upload-section">
+        <!-- Wizard Step Indicator -->
+        <div class="wizard-steps" id="wizard-indicator">
+            <div class="wizard-step active" data-step="1">
+                <span class="wizard-step-number">1</span>
+                <span class="wizard-step-label">Source</span>
+            </div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step" data-step="2">
+                <span class="wizard-step-number">2</span>
+                <span class="wizard-step-label">Trim</span>
+            </div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step" data-step="3">
+                <span class="wizard-step-number">3</span>
+                <span class="wizard-step-label">Translate</span>
+            </div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step" data-step="4">
+                <span class="wizard-step-number">4</span>
+                <span class="wizard-step-label">Edit</span>
+            </div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step" data-step="5">
+                <span class="wizard-step-number">5</span>
+                <span class="wizard-step-label">Export</span>
+            </div>
+        </div>
+
+        <!-- Step 1: Video Source Selection -->
+        <div class="card wizard-card" id="step-source" data-step="1">
+            <h2 class="step-title">Choose Your Video Source</h2>
+            
+            <!-- Upload Zone -->
             <div class="upload-zone" id="drop-zone">
                 <div class="upload-icon">
                     <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none"
@@ -40,7 +72,7 @@
                         <line x1="12" y1="3" x2="12" y2="15" />
                     </svg>
                 </div>
-                <h2>Drop your video here</h2>
+                <h3>Drop your video here</h3>
                 <p>or click to browse</p>
                 <span class="file-types">Supports MP4, MOV, AVI, MKV</span>
                 <input type="file" id="file-input" accept=".mp4,.mov,.avi,.mkv" hidden>
@@ -56,6 +88,94 @@
                     <button class="remove-file" id="remove-file">✕</button>
                 </div>
             </div>
+
+            <div class="divider-or">
+                <span>OR</span>
+            </div>
+
+            <!-- URL Input -->
+            <div class="url-input-section">
+                <label class="option-label">
+                    <span class="label-icon">🔗</span>
+                    Paste YouTube or X/Twitter URL
+                </label>
+                <div class="url-input-wrapper">
+                    <input type="text" id="video-url" class="text-input" 
+                           placeholder="https://youtube.com/watch?v=... or https://x.com/...">
+                    <span class="url-source-icon" id="url-source-icon"></span>
+                </div>
+                <div class="url-preview" id="url-preview" style="display: none;">
+                    <img id="url-thumbnail" src="" alt="Video thumbnail">
+                    <div class="url-info">
+                        <span class="url-title" id="url-title"></span>
+                        <span class="url-duration" id="url-duration"></span>
+                    </div>
+                    <button class="remove-file" id="remove-url">✕</button>
+                </div>
+                <div class="url-loading" id="url-loading" style="display: none;">
+                    <span class="spinner"></span>
+                    <span>Fetching video info...</span>
+                </div>
+                <div class="url-error" id="url-error" style="display: none;"></div>
+            </div>
+
+            <div class="wizard-nav">
+                <div></div>
+                <button class="btn btn-primary" id="step1-next" disabled>
+                    Next <span class="btn-arrow">→</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Step 2: Video Preview & Trim -->
+        <div class="card wizard-card" id="step-trim" data-step="2" style="display: none;">
+            <h2 class="step-title">Preview & Trim Video</h2>
+            <p class="step-subtitle">Optionally trim your video before translating</p>
+
+            <div class="video-preview-container">
+                <video id="trim-video" controls>
+                    Your browser does not support the video tag.
+                </video>
+            </div>
+
+            <div class="trim-controls">
+                <div class="trim-slider-container">
+                    <div class="trim-slider" id="trim-slider">
+                        <div class="trim-range" id="trim-range"></div>
+                        <div class="trim-handle trim-handle-start" id="trim-handle-start"></div>
+                        <div class="trim-handle trim-handle-end" id="trim-handle-end"></div>
+                    </div>
+                    <div class="trim-times">
+                        <span id="trim-start-time">00:00</span>
+                        <span id="trim-duration">Duration: --:--</span>
+                        <span id="trim-end-time">00:00</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="download-progress" id="download-progress" style="display: none;">
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="download-progress-bar"></div>
+                </div>
+                <p id="download-status-text">Downloading video...</p>
+            </div>
+
+            <div class="wizard-nav">
+                <button class="btn btn-secondary" id="step2-back">
+                    <span class="btn-arrow">←</span> Back
+                </button>
+                <div class="nav-buttons">
+                    <button class="btn btn-ghost" id="step2-skip">Skip Trimming</button>
+                    <button class="btn btn-primary" id="step2-next">
+                        Trim & Continue <span class="btn-arrow">→</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Step 3: Translation Settings & Processing -->
+        <div class="card wizard-card" id="step-translate" data-step="3" style="display: none;">
+            <h2 class="step-title">Translation Settings</h2>
 
             <div class="options-section">
                 <div class="option-group">
@@ -99,51 +219,92 @@
                         <option value="mistral">mistral</option>
                         <option value="gemma2">gemma2</option>
                     </select>
-                    <p class="option-hint">Make sure Ollama is running locally</p>
                 </div>
             </div>
 
-            <button class="btn btn-primary btn-large" id="process-btn" disabled>
-                <span class="btn-icon">✨</span>
-                Generate Subtitles
-            </button>
+            <!-- Processing progress (shown when translating) -->
+            <div class="processing-section" id="processing-section" style="display: none;">
+                <div class="progress-header">
+                    <h3>Processing Your Video</h3>
+                    <p id="status-text">Preparing...</p>
+                </div>
+
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="progress-bar"></div>
+                </div>
+
+                <div class="progress-steps">
+                    <div class="step" id="step-upload">
+                        <span class="step-icon">📤</span>
+                        <span class="step-label">Upload</span>
+                    </div>
+                    <div class="step" id="step-extract">
+                        <span class="step-icon">🎵</span>
+                        <span class="step-label">Extract</span>
+                    </div>
+                    <div class="step" id="step-transcribe">
+                        <span class="step-icon">🎤</span>
+                        <span class="step-label">Transcribe</span>
+                    </div>
+                    <div class="step" id="step-translate-progress">
+                        <span class="step-icon">🌐</span>
+                        <span class="step-label">Translate</span>
+                    </div>
+                    <div class="step" id="step-embed">
+                        <span class="step-icon">🎬</span>
+                        <span class="step-label">Embed</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="wizard-nav" id="translate-nav">
+                <button class="btn btn-secondary" id="step3-back">
+                    <span class="btn-arrow">←</span> Back
+                </button>
+                <button class="btn btn-primary btn-large" id="start-translation">
+                    <span class="btn-icon">✨</span>
+                    Start Translation
+                </button>
+            </div>
         </div>
 
-        <div class="card progress-card" id="progress-section" style="display: none;">
-            <div class="progress-header">
-                <h2>Processing Your Video</h2>
-                <p id="status-text">Preparing...</p>
+        <!-- Step 4: Subtitle Editor -->
+        <div class="card wizard-card editor-card" id="step-edit" data-step="4" style="display: none;">
+            <h2 class="step-title">Edit Subtitles</h2>
+            <p class="step-subtitle">Click on any subtitle to edit the text</p>
+
+            <div class="editor-container">
+                <div class="editor-video-container">
+                    <video id="editor-video" controls>
+                        Your browser does not support the video tag.
+                    </video>
+                    <div class="current-subtitle" id="current-subtitle"></div>
+                </div>
+
+                <div class="timeline-container">
+                    <div class="timeline" id="timeline">
+                        <!-- Subtitle blocks will be rendered here -->
+                    </div>
+                    <div class="timeline-playhead" id="timeline-playhead"></div>
+                </div>
+
+                <div class="subtitle-list" id="subtitle-list">
+                    <!-- Editable subtitle list will be rendered here -->
+                </div>
             </div>
 
-            <div class="progress-bar-container">
-                <div class="progress-bar" id="progress-bar"></div>
-            </div>
-
-            <div class="progress-steps">
-                <div class="step" id="step-upload">
-                    <span class="step-icon">📤</span>
-                    <span class="step-label">Upload</span>
-                </div>
-                <div class="step" id="step-extract">
-                    <span class="step-icon">🎵</span>
-                    <span class="step-label">Extract Audio</span>
-                </div>
-                <div class="step" id="step-transcribe">
-                    <span class="step-icon">🎤</span>
-                    <span class="step-label">Transcribe</span>
-                </div>
-                <div class="step" id="step-translate">
-                    <span class="step-icon">🌐</span>
-                    <span class="step-label">Translate</span>
-                </div>
-                <div class="step" id="step-embed">
-                    <span class="step-icon">🎬</span>
-                    <span class="step-label">Embed</span>
-                </div>
+            <div class="wizard-nav">
+                <button class="btn btn-secondary" id="step4-skip">
+                    Skip Editing
+                </button>
+                <button class="btn btn-primary" id="step4-next">
+                    Save & Continue <span class="btn-arrow">→</span>
+                </button>
             </div>
         </div>
 
-        <div class="card success-card" id="success-section" style="display: none;">
+        <!-- Step 5: Export -->
+        <div class="card wizard-card" id="step-export" data-step="5" style="display: none;">
             <div class="success-icon">🎉</div>
             <h2>Your Video is Ready!</h2>
             <p>Subtitles have been successfully added to your video</p>
@@ -169,6 +330,14 @@
                     <span class="stat-label">Est. Cost</span>
                     <span class="stat-value" id="total-cost">--</span>
                 </div>
+            </div>
+
+            <!-- Re-burn progress (shown when re-burning after edit) -->
+            <div class="reburn-progress" id="reburn-progress" style="display: none;">
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="reburn-progress-bar"></div>
+                </div>
+                <p id="reburn-status-text">Re-embedding subtitles...</p>
             </div>
 
             <div class="download-buttons">
@@ -205,6 +374,7 @@
             </button>
         </div>
 
+        <!-- Error Section -->
         <div class="card error-card" id="error-section" style="display: none;">
             <div class="error-icon">❌</div>
             <h2>Something Went Wrong</h2>
