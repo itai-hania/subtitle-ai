@@ -101,11 +101,11 @@ def trim_video(
     trim_duration = end_time - start_time
     
     if reencode:
-        # Re-encode for accuracy (slower)
+        # Re-encode for accuracy — -ss before -i for fast seeking
         cmd = [
             "ffmpeg", "-y",
-            "-i", str(input_path),
             "-ss", format_time(start_time),
+            "-i", str(input_path),
             "-t", format_time(trim_duration),
             "-c:v", "libx264",
             "-preset", "fast",
