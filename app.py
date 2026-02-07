@@ -536,7 +536,7 @@ def extract_audio(video_path: str, audio_path: str):
 
 def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_language: str):
     """Embed subtitles and watermark into video using FFmpeg"""
-    style = "FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=1"
+    style = "FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H40000000,BackColour=&H80000000,Outline=1,Shadow=2,Bold=0,MarginV=30"
     
     srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "'\\''")
     
@@ -1226,7 +1226,7 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest):
     trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
     
     try:
-        trim_video(video_path, str(trimmed_path), start_time, end_time)
+        trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=True)
         
         # Update job with trim info
         job["original_video"] = video_path

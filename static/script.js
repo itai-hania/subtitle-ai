@@ -1001,6 +1001,10 @@ function renderSubtitleEditor() {
     // Set video source
     editorVideo.src = `/video-preview/${currentJobId}`;
     
+    // Update subtitle count
+    const countEl = document.getElementById('subtitle-count');
+    if (countEl) countEl.textContent = `${subtitles.length} segments`;
+    
     // Get video duration for timeline
     const totalDuration = subtitles.length > 0 
         ? subtitles[subtitles.length - 1].end 
@@ -1037,7 +1041,7 @@ function renderSubtitleEditor() {
         
         item.innerHTML = `
             <div class="subtitle-time">
-                ${formatTime(sub.start)} - ${formatTime(sub.end)}
+                ${formatTime(sub.start)} → ${formatTime(sub.end)}
             </div>
             <div class="subtitle-content">
                 <div class="subtitle-original">${sub.original_text}</div>
@@ -1045,10 +1049,17 @@ function renderSubtitleEditor() {
             </div>
         `;
         
+        // Click on item (not textarea) to seek video
+        item.addEventListener('click', (e) => {
+            if (e.target.tagName !== 'TEXTAREA') {
+                editorVideo.currentTime = sub.start;
+                highlightSubtitle(sub.id);
+            }
+        });
+        
         const textarea = item.querySelector('textarea');
         textarea.addEventListener('input', () => {
             hasEdits = true;
-            // Update subtitle in memory
             const idx = subtitles.findIndex(s => s.id === sub.id);
             if (idx !== -1) {
                 subtitles[idx].text = textarea.value;

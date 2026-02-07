@@ -286,25 +286,35 @@
         <!-- Step 4: Subtitle Editor -->
         <div class="card wizard-card editor-card" id="step-edit" data-step="4" style="display: none;">
             <h2 class="step-title">Edit Subtitles</h2>
-            <p class="step-subtitle">Click on any subtitle to edit the text</p>
+            <p class="step-subtitle">Review and edit translated subtitles. Click a subtitle to seek to that point.</p>
 
-            <div class="editor-container">
-                <div class="editor-video-container">
-                    <video id="editor-video" controls>
-                        Your browser does not support the video tag.
-                    </video>
-                    <div class="current-subtitle" id="current-subtitle"></div>
-                </div>
-
-                <div class="timeline-container">
-                    <div class="timeline" id="timeline">
-                        <!-- Subtitle blocks will be rendered here -->
+            <div class="editor-layout">
+                <!-- Left: Video + Timeline -->
+                <div class="editor-left">
+                    <div class="editor-video-container">
+                        <video id="editor-video" controls>
+                            Your browser does not support the video tag.
+                        </video>
+                        <div class="current-subtitle" id="current-subtitle"></div>
                     </div>
-                    <div class="timeline-playhead" id="timeline-playhead"></div>
+
+                    <div class="timeline-container">
+                        <div class="timeline" id="timeline">
+                            <!-- Subtitle blocks will be rendered here -->
+                        </div>
+                        <div class="timeline-playhead" id="timeline-playhead"></div>
+                    </div>
                 </div>
 
-                <div class="subtitle-list" id="subtitle-list">
-                    <!-- Editable subtitle list will be rendered here -->
+                <!-- Right: Scrollable subtitle list -->
+                <div class="editor-right">
+                    <div class="subtitle-list-header">
+                        <span class="subtitle-list-title">Subtitles</span>
+                        <span class="subtitle-count" id="subtitle-count"></span>
+                    </div>
+                    <div class="subtitle-list" id="subtitle-list">
+                        <!-- Editable subtitle list will be rendered here -->
+                    </div>
                 </div>
             </div>
 
