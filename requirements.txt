@@ -17,4 +17,4 @@ python-bidi
 arabic-reshaper
 
 # Video Downloading
-yt-dlp          # Download videos from YouTube, X/Twitter, and other platforms
+yt-dlp>=2025.11  # Requires 3.10+; versions before this have broken YouTube support

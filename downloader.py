@@ -81,19 +81,18 @@ def get_video_info(url: str) -> VideoInfo:
         'no_warnings': True,
         'extract_flat': False,
     }
-    
-    # Add Twitter auth if available
+
     if source == VideoSource.TWITTER:
         username = os.getenv('X_USERNAME')
         password = os.getenv('X_PASSWORD')
         if username and password:
             ydl_opts['username'] = username
             ydl_opts['password'] = password
-    
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
+
             return VideoInfo(
                 title=info.get('title', 'Unknown Title'),
                 duration=float(info.get('duration', 0)),
@@ -136,17 +135,9 @@ def download_video(
     
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
-    
-    # Build format string based on quality
-    if quality == "720p":
-        format_str = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
-    elif quality == "1080p":
-        format_str = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
-    else:  # "best"
-        format_str = 'bestvideo+bestaudio/best'
-    
+
     output_template = str(output_dir / f"{job_id}_downloaded.%(ext)s")
-    
+
     def progress_hook(d):
         if progress_callback and d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
@@ -156,7 +147,14 @@ def download_video(
                 progress_callback(percent, 'downloading')
         elif progress_callback and d['status'] == 'finished':
             progress_callback(100, 'processing')
-    
+
+    if quality == "720p":
+        format_str = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+    elif quality == "1080p":
+        format_str = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
+    else:
+        format_str = 'bestvideo+bestaudio/best'
+
     ydl_opts = {
         'format': format_str,
         'outtmpl': output_template,
@@ -165,32 +163,31 @@ def download_video(
         'no_warnings': True,
         'progress_hooks': [progress_hook],
     }
-    
-    # Add Twitter auth if available
+
     if source == VideoSource.TWITTER:
         username = os.getenv('X_USERNAME')
         password = os.getenv('X_PASSWORD')
         if username and password:
             ydl_opts['username'] = username
             ydl_opts['password'] = password
-    
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        
+
         # Find the downloaded file (extension might vary)
         for ext in ['mp4', 'webm', 'mkv', 'mov']:
             output_path = output_dir / f"{job_id}_downloaded.{ext}"
             if output_path.exists():
                 return output_path
-        
+
         # Fallback: look for any file starting with job_id
         for file in output_dir.iterdir():
             if file.name.startswith(f"{job_id}_downloaded"):
                 return file
-        
+
         raise Exception("Download completed but output file not found")
-        
+
     except Exception as e:
         raise Exception(f"Failed to download video: {str(e)}")
 
