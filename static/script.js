@@ -12,6 +12,8 @@ let videoUrl = null;
 let videoInfo = null;
 let currentJobId = null;
 let statusInterval = null;
+let downloadInterval = null;
+let reburnInterval = null;
 let trimStart = 0;
 let trimEnd = 0;
 let videoDuration = 0;
@@ -112,6 +114,7 @@ const retryBtn = document.getElementById('retry-btn');
 
 function goToStep(step) {
     currentStep = step;
+    clearAllIntervals();
     
     // Update wizard indicator
     wizardSteps.forEach((el, index) => {
@@ -150,6 +153,7 @@ function goToStep(step) {
 }
 
 function showError(message) {
+    clearAllIntervals();
     errorMessage.textContent = message;
     [stepSource, stepTrim, stepTranslate, stepEdit, stepExport].forEach(el => {
         el.style.display = 'none';
@@ -160,6 +164,12 @@ function showError(message) {
 // ============================================
 // Utility Functions
 // ============================================
+
+function clearAllIntervals() {
+    if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
+    if (downloadInterval) { clearInterval(downloadInterval); downloadInterval = null; }
+    if (reburnInterval) { clearInterval(reburnInterval); reburnInterval = null; }
+}
 
 function formatFileSize(bytes) {
     if (bytes === 0) return '0 Bytes';
@@ -436,7 +446,7 @@ async function downloadFromUrl() {
 
 async function pollDownloadStatus() {
     return new Promise((resolve, reject) => {
-        const interval = setInterval(async () => {
+        downloadInterval = setInterval(async () => {
             try {
                 const response = await fetch(`/download-status/${currentJobId}`);
                 const data = await response.json();
@@ -447,7 +457,8 @@ async function pollDownloadStatus() {
                     : `Downloading: ${data.progress}%`;
                 
                 if (data.status === 'downloaded') {
-                    clearInterval(interval);
+                    clearInterval(downloadInterval);
+                    downloadInterval = null;
                     downloadProgress.style.display = 'none';
                     
                     // Get video duration
@@ -466,11 +477,13 @@ async function pollDownloadStatus() {
                     
                     resolve();
                 } else if (data.status === 'error') {
-                    clearInterval(interval);
+                    clearInterval(downloadInterval);
+                    downloadInterval = null;
                     reject(new Error(data.error || 'Download failed'));
                 }
             } catch (error) {
-                clearInterval(interval);
+                clearInterval(downloadInterval);
+                downloadInterval = null;
                 reject(error);
             }
         }, 1000);
@@ -538,11 +551,19 @@ trimHandleEnd.addEventListener('mousedown', (e) => {
 
 // Sync video with trim handles
 trimVideo.addEventListener('loadedmetadata', () => {
-    if (!videoDuration) {
+    if (!videoDuration || isNaN(trimVideo.duration)) {
         videoDuration = trimVideo.duration;
         trimEnd = videoDuration;
         updateTrimUI();
     }
+});
+
+trimVideo.addEventListener('error', () => {
+    showError('Failed to load video preview. The file may be corrupt or unsupported.');
+});
+
+editorVideo.addEventListener('error', () => {
+    console.error('Editor video failed to load');
 });
 
 step2Back.addEventListener('click', () => {
@@ -958,27 +979,30 @@ async function saveSubtitlesAndReburn() {
 
 async function pollReburnStatus() {
     return new Promise((resolve, reject) => {
-        const interval = setInterval(async () => {
+        reburnInterval = setInterval(async () => {
             try {
                 const response = await fetch(`/status/${currentJobId}`);
                 const data = await response.json();
                 
                 reburnProgressBar.style.width = `${data.progress}%`;
-                reburnStatusText.textContent = data.status === 'reburing' 
+                reburnStatusText.textContent = data.status === 'reburning' 
                     ? `Re-embedding subtitles: ${data.progress}%`
                     : 'Finishing up...';
                 
                 if (data.status === 'completed') {
-                    clearInterval(interval);
+                    clearInterval(reburnInterval);
+                    reburnInterval = null;
                     reburnProgress.style.display = 'none';
                     downloadVideoBtn.disabled = false;
                     resolve();
                 } else if (data.status === 'error') {
-                    clearInterval(interval);
+                    clearInterval(reburnInterval);
+                    reburnInterval = null;
                     reject(new Error(data.error || 'Re-burn failed'));
                 }
             } catch (error) {
-                clearInterval(interval);
+                clearInterval(reburnInterval);
+                reburnInterval = null;
                 reject(error);
             }
         }, 1000);
@@ -1040,10 +1064,7 @@ function resetApp() {
     subtitles = [];
     hasEdits = false;
     
-    if (statusInterval) {
-        clearInterval(statusInterval);
-        statusInterval = null;
-    }
+    clearAllIntervals();
     
     // Reset UI
     clearFile();

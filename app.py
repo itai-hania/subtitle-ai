@@ -6,6 +6,7 @@ Supports OpenAI Whisper for transcription and OpenAI/Ollama for translation
 import os
 import uuid
 import json
+import shutil
 import subprocess
 import tempfile
 import re
@@ -24,6 +25,9 @@ import ollama
 
 from downloader import detect_source, get_video_info, download_video as download_video_from_url, is_valid_url, VideoSource
 from trimmer import get_video_duration, trim_video, get_video_info as get_video_file_info
+
+# Valid job ID pattern (alphanumeric and hyphens only)
+JOB_ID_PATTERN = re.compile(r'^[a-zA-Z0-9-]{1,36}$')
 
 load_dotenv()
 
@@ -55,6 +59,31 @@ jobs = {}
 
 # OpenAI client
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def validate_job_id(job_id: str) -> bool:
+    """Validate job_id is safe (alphanumeric/hyphens only, no path traversal)."""
+    return bool(JOB_ID_PATTERN.match(job_id))
+
+
+def find_video_path(job_id: str) -> Optional[str]:
+    """Find video file path for a job, checking job dict and filesystem."""
+    job = jobs.get(job_id)
+    if not job:
+        return None
+    
+    video_path = job.get("video_path")
+    if video_path and Path(video_path).exists():
+        return video_path
+    
+    # Search uploads and downloads directories
+    for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR]:
+        for ext in ['mp4', 'mov', 'avi', 'mkv']:
+            for file in search_dir.iterdir():
+                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
+                    return str(file)
+    
+    return None
 
 
 def format_timestamp(seconds: float) -> str:
@@ -473,6 +502,7 @@ def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_lan
 def process_video(job_id: str, video_path: str, target_language: str, use_ollama: bool, ollama_model: str):
     """Main processing pipeline"""
     start_time = time.time()
+    temp_dir = None
     
     try:
         jobs[job_id]["status"] = "extracting_audio"
@@ -496,6 +526,8 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         
         # Step 3: Generate SRT (with translation if needed)
         segments = transcript.segments if hasattr(transcript, 'segments') else transcript.get('segments', [])
+        if not segments:
+            raise Exception("No speech detected in video. Cannot generate subtitles.")
         srt_content, original_srt_content, token_usage, subtitles_data = generate_srt(segments, target_language, use_ollama, ollama_model)
         
         # Save standard SRT for download
@@ -549,11 +581,8 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         print(f"Token usage: Input={token_usage['prompt_tokens']:,} (${input_cost:.4f}) | Output={token_usage['completion_tokens']:,} (${output_cost:.4f}) | Total cost: ${total_cost:.4f}")
         
         # Cleanup temp files
-        os.remove(audio_path)
-        os.remove(srt_path)
-        if os.path.exists(srt_path_burning):
-            os.remove(srt_path_burning)
-        os.rmdir(temp_dir)
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
         
     except Exception as e:
         elapsed_time = time.time() - start_time
@@ -561,6 +590,10 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
         jobs[job_id]["error"] = str(e)
         jobs[job_id]["elapsed_seconds"] = int(elapsed_time)
         print(f"Error processing video: {e}")
+    finally:
+        # Always cleanup temp files
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.post("/upload")
@@ -652,21 +685,13 @@ async def process_existing_video(
     background_tasks: BackgroundTasks
 ):
     """Start translation processing on an already downloaded/uploaded video."""
-    if job_id not in jobs:
+    if not validate_job_id(job_id) or job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs[job_id]
-    video_path = job.get("video_path")
+    video_path = find_video_path(job_id)
     
-    # Also check for uploaded files
     if not video_path:
-        for ext in ['mp4', 'mov', 'avi', 'mkv']:
-            for file in UPLOAD_DIR.iterdir():
-                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
-                    video_path = str(file)
-                    break
-    
-    if not video_path or not Path(video_path).exists():
         raise HTTPException(status_code=404, detail="Video file not found. Upload or download a video first.")
     
     # Update job for processing
@@ -740,7 +765,7 @@ async def download_srt(job_id: str):
     
     return FileResponse(
         path=str(srt_path),
-        filename=f"subtitles_{job['original_filename'].replace('.mp4', '.srt')}",
+        filename=f"subtitles_{Path(job['original_filename']).stem}.srt",
         media_type="text/plain"
     )
 
@@ -767,7 +792,7 @@ async def download_transcription(job_id: str):
     
     return FileResponse(
         path=str(srt_path),
-        filename=f"transcription_{job['original_filename'].replace('.mp4', '.srt')}",
+        filename=f"transcription_{Path(job['original_filename']).stem}.srt",
         media_type="text/plain"
     )
 
@@ -808,7 +833,7 @@ async def download_srt_txt(job_id: str):
     
     return FileResponse(
         path=str(txt_path),
-        filename=f"subtitles_{job['original_filename'].replace('.mp4', '.txt')}",
+        filename=f"subtitles_{Path(job['original_filename']).stem}.txt",
         media_type="text/plain"
     )
 
@@ -837,7 +862,7 @@ async def download_transcription_txt(job_id: str):
     
     return FileResponse(
         path=str(txt_path),
-        filename=f"transcription_{job['original_filename'].replace('.mp4', '.txt')}",
+        filename=f"transcription_{Path(job['original_filename']).stem}.txt",
         media_type="text/plain"
     )
 
@@ -994,21 +1019,12 @@ async def get_download_status(job_id: str):
 @app.get("/video-preview/{job_id}")
 async def preview_video(job_id: str):
     """Stream video for HTML5 player preview."""
-    if job_id not in jobs:
+    if not validate_job_id(job_id) or job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    job = jobs[job_id]
-    video_path = job.get("video_path")
+    video_path = find_video_path(job_id)
     
     if not video_path:
-        # Check if this is an upload job
-        for ext in ['mp4', 'mov', 'avi', 'mkv']:
-            for file in UPLOAD_DIR.iterdir():
-                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
-                    video_path = str(file)
-                    break
-    
-    if not video_path or not Path(video_path).exists():
         raise HTTPException(status_code=404, detail="Video file not found")
     
     return FileResponse(
@@ -1033,21 +1049,12 @@ class TrimRequest(BaseModel):
 @app.get("/video-duration/{job_id}")
 async def get_video_duration_endpoint(job_id: str):
     """Get video duration for trimming UI."""
-    if job_id not in jobs:
+    if not validate_job_id(job_id) or job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    job = jobs[job_id]
-    video_path = job.get("video_path")
+    video_path = find_video_path(job_id)
     
-    # Also check for uploaded files
     if not video_path:
-        for ext in ['mp4', 'mov', 'avi', 'mkv']:
-            for file in UPLOAD_DIR.iterdir():
-                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
-                    video_path = str(file)
-                    break
-    
-    if not video_path or not Path(video_path).exists():
         raise HTTPException(status_code=404, detail="Video file not found")
     
     try:
@@ -1067,21 +1074,13 @@ async def get_video_duration_endpoint(job_id: str):
 @app.post("/trim/{job_id}")
 async def trim_video_endpoint(job_id: str, request: TrimRequest):
     """Trim video to specified time range."""
-    if job_id not in jobs:
+    if not validate_job_id(job_id) or job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs[job_id]
-    video_path = job.get("video_path")
+    video_path = find_video_path(job_id)
     
-    # Also check for uploaded files
     if not video_path:
-        for ext in ['mp4', 'mov', 'avi', 'mkv']:
-            for file in UPLOAD_DIR.iterdir():
-                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
-                    video_path = str(file)
-                    break
-    
-    if not video_path or not Path(video_path).exists():
         raise HTTPException(status_code=404, detail="Video file not found")
     
     start_time = request.start_time
@@ -1126,22 +1125,17 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest):
 @app.post("/skip-trim/{job_id}")
 async def skip_trim(job_id: str):
     """Skip trimming and use original video."""
-    if job_id not in jobs:
+    if not validate_job_id(job_id) or job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs[job_id]
-    video_path = job.get("video_path")
+    video_path = find_video_path(job_id)
     
     if not video_path:
-        for ext in ['mp4', 'mov', 'avi', 'mkv']:
-            for file in UPLOAD_DIR.iterdir():
-                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
-                    video_path = str(file)
-                    job["video_path"] = video_path
-                    break
-    
-    if not video_path or not Path(video_path).exists():
         raise HTTPException(status_code=404, detail="Video file not found")
+    
+    # Ensure job has the path stored
+    job["video_path"] = video_path
     
     try:
         duration = get_video_duration(video_path)
@@ -1234,26 +1228,18 @@ async def update_subtitles(job_id: str, request: SubtitlesUpdateRequest):
 
 def reburn_video_task(job_id: str):
     """Background task to re-burn subtitles into video."""
+    temp_dir = None
     try:
         job = jobs[job_id]
-        job["status"] = "reburing"
+        job["status"] = "reburning"
         job["progress"] = 10
         
-        # Get video path (use original if trimmed, otherwise uploaded)
-        video_path = job.get("original_video") or job.get("video_path")
-        
-        # If no original_video, find uploaded file
-        if not video_path:
-            for ext in ['mp4', 'mov', 'avi', 'mkv']:
-                for file in UPLOAD_DIR.iterdir():
-                    if file.name.startswith(job_id) and not "_trimmed" in file.name and file.suffix.lower() == f'.{ext}':
-                        video_path = str(file)
-                        break
-        
-        # Use trimmed if available
+        # Use trimmed video if available, otherwise find the original
         trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
         if trimmed_path.exists():
             video_path = str(trimmed_path)
+        else:
+            video_path = find_video_path(job_id)
         
         if not video_path or not Path(video_path).exists():
             raise Exception("Video file not found")
@@ -1289,13 +1275,12 @@ def reburn_video_task(job_id: str):
         job["progress"] = 100
         job["output_file"] = output_filename
         
-        # Cleanup temp files
-        os.remove(srt_path)
-        os.rmdir(temp_dir)
-        
     except Exception as e:
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"] = str(e)
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.post("/reburn/{job_id}")
