@@ -3,6 +3,7 @@ Video Downloader Module
 Handles downloading videos from YouTube and X/Twitter using yt-dlp
 """
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 import yt_dlp
+
+logger = logging.getLogger(__name__)
 
 
 class VideoSource(Enum):

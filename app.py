@@ -3,49 +3,77 @@ Video Subtitle Generator API
 Supports OpenAI Whisper for transcription and OpenAI/Ollama for translation
 """
 
+import logging
 import os
-import uuid
-import json
-import shutil
-import subprocess
-import tempfile
 import re
+import shutil
+import tempfile
 import threading
-import platform
+import time
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from datetime import datetime, timedelta
-import time
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Query
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-from pydantic import BaseModel
-from dotenv import load_dotenv
-import openai
 import ollama
+import openai
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from downloader import detect_source, get_video_info, download_video as download_video_from_url, is_valid_url, VideoSource
-from trimmer import get_video_duration, trim_video, get_video_info as get_video_file_info
+from downloader import (
+    download_video as download_video_from_url,
+    get_video_info,
+    is_valid_url,
+)
+from processing import (
+    embed_subtitles,
+    extract_audio,
+    generate_srt,
+    has_audio_stream,
+    process_srt_for_rtl,
+    srt_to_plain_text,
+    subtitles_to_srt,
+    transcribe_audio,
+    validate_audio_size,
+)
+from trimmer import get_video_duration, get_video_info as get_video_file_info, trim_video
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 # Valid job ID pattern (alphanumeric and hyphens only)
 JOB_ID_PATTERN = re.compile(r'^[a-zA-Z0-9-]{1,36}$')
 
 load_dotenv()
 
+# Upload size limit (500 MB)
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: start cleanup scheduler on startup."""
     import asyncio
-    
+
     async def periodic_cleanup():
         while True:
-            await asyncio.sleep(3600)  # Run every hour
+            await asyncio.sleep(3600)
             cleanup_old_jobs()
-    
+
     task = asyncio.create_task(periodic_cleanup())
     yield
     task.cancel()
@@ -53,10 +81,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Video Subtitle Generator", lifespan=lifespan)
 
-# CORS middleware
+# CORS middleware — restrict to same-origin (no wildcard with credentials)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -84,7 +112,7 @@ WATERMARK_CONFIG = {
 }
 
 # Store job status
-jobs = {}
+jobs: dict = {}
 jobs_lock = threading.Lock()
 
 # Job expiration
@@ -109,78 +137,61 @@ class Progress:
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
+# ============================================
+# Dependencies
+# ============================================
+
 def validate_job_id(job_id: str) -> bool:
     """Validate job_id is safe (alphanumeric/hyphens only, no path traversal)."""
     return bool(JOB_ID_PATTERN.match(job_id))
 
 
+def get_validated_job(job_id: str) -> dict:
+    """FastAPI dependency: validate job_id and return the job dict, or raise 404."""
+    if not validate_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return jobs[job_id]
+
+
+# ============================================
+# Helpers
+# ============================================
+
 def find_video_path(job_id: str) -> Optional[str]:
     """Find video file path for a job. Prefers output (subtitled) video if available."""
     job = jobs.get(job_id)
     if not job:
-        print(f"[find_video_path] Job {job_id} not found in jobs dict")
+        logger.debug("Job %s not found in jobs dict", job_id)
         return None
-    
+
     # Prefer the processed output video (with burned subtitles)
     output_file = job.get("output_file")
     if output_file:
         output_path = OUTPUT_DIR / output_file
         if output_path.exists():
-            print(f"[find_video_path] Found output video: {output_path}")
+            logger.debug("Found output video: %s", output_path)
             return str(output_path)
-    
+
     video_path = job.get("video_path")
     if video_path and Path(video_path).exists():
-        print(f"[find_video_path] Found via job dict: {video_path}")
+        logger.debug("Found via job dict: %s", video_path)
         return video_path
-    
-    # Search uploads and downloads directories
+
+    # Fallback: search uploads and downloads directories
     for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR]:
         for ext in ['mp4', 'mov', 'avi', 'mkv']:
             for file in search_dir.iterdir():
                 if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
-                    print(f"[find_video_path] Found via filesystem search: {file}")
+                    logger.debug("Found via filesystem search: %s", file)
                     return str(file)
-    
-    print(f"[find_video_path] No video found for job {job_id}")
+
+    logger.debug("No video found for job %s", job_id)
     return None
 
 
-def has_audio_stream(video_path: str) -> bool:
-    """Check if video file has an audio stream."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a:0",
-        "-show_entries", "stream=codec_type",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        video_path
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return result.stdout.strip() == "audio"
-    except Exception:
-        return False
-
-
-def parse_ffmpeg_error(stderr: str) -> str:
-    """Convert FFmpeg errors to user-friendly messages."""
-    stderr_lower = stderr.lower() if stderr else ""
-    if "no space left on device" in stderr_lower:
-        return "Server disk is full. Please try again later."
-    if "invalid argument" in stderr_lower or "invalid data" in stderr_lower:
-        return "Video file is corrupt or uses an unsupported format."
-    if "codec not currently supported" in stderr_lower or "decoder" in stderr_lower and "not found" in stderr_lower:
-        return "Video codec is not supported. Try converting to MP4 first."
-    if "permission denied" in stderr_lower:
-        return "Permission denied when accessing video file."
-    if "no such file" in stderr_lower:
-        return "Video file not found."
-    if "does not contain any stream" in stderr_lower:
-        return "Video file has no valid streams."
-    return f"Video processing failed: {stderr[:200] if stderr else 'Unknown error'}"
-
-
-def cleanup_old_jobs():
+def cleanup_old_jobs() -> None:
     """Remove jobs older than JOB_TTL and their associated files."""
     now = datetime.now()
     with jobs_lock:
@@ -189,7 +200,6 @@ def cleanup_old_jobs():
             if now - job.get("created_at", now) > JOB_TTL
         ]
     for jid in expired:
-        # Clean up associated files
         for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR, OUTPUT_DIR]:
             for file in search_dir.iterdir():
                 if file.name.startswith(jid):
@@ -200,508 +210,100 @@ def cleanup_old_jobs():
         with jobs_lock:
             jobs.pop(jid, None)
     if expired:
-        print(f"Cleaned up {len(expired)} expired job(s)")
+        logger.info("Cleaned up %d expired job(s)", len(expired))
 
 
-def format_timestamp(seconds: float) -> str:
-    """Convert seconds to SRT timestamp format (HH:MM:SS,mmm)"""
-    td = timedelta(seconds=seconds)
-    hours, remainder = divmod(td.total_seconds(), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    milliseconds = int((seconds % 1) * 1000)
-    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d},{milliseconds:03d}"
+async def save_upload_chunked(upload: UploadFile, dest: Path) -> int:
+    """Write an UploadFile to disk in 1MB chunks. Returns bytes written."""
+    total = 0
+    with open(dest, "wb") as f:
+        while True:
+            chunk = await upload.read(1024 * 1024)  # 1 MB
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                f.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024*1024)}MB."
+                )
+            f.write(chunk)
+    return total
 
 
-def transcribe_audio(audio_path: str) -> dict:
-    """Transcribe audio using OpenAI Whisper API"""
-    with open(audio_path, "rb") as audio_file:
-        transcript = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"]
-        )
-    return transcript
-
-
-def batch_translate_openai(texts: list, target_language: str, chunk_num: int = 0) -> tuple:
-    """Translate a batch of texts using OpenAI GPT in a single API call.
-    Returns (translations, token_usage) tuple."""
-    if target_language.lower() == "english" or not texts:
-        return texts, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    
-    # Create numbered format for batch translation
-    numbered_text = "\n".join([f"[{i+1}] {text}" for i, text in enumerate(texts)])
-    
-    response = openai_client.chat.completions.create(
-        model="gpt-5-mini",
-        reasoning_effort="low",
-        max_completion_tokens=10000,
-        messages=[
-            {
-                "role": "system",
-                "content": f"""You are an expert Hebrew subtitle translator with deep knowledge of both English and Hebrew idioms, grammar, and natural speech patterns. Translate each numbered line to {target_language}.
-
-CRITICAL RULES:
-1. Keep the EXACT same numbering format: [1], [2], [3], etc.
-2. Each translation MUST start with its number in brackets on its own line
-3. Translate EVERY word - do not leave ANY English words
-4. Output ONLY the numbered translations, nothing else
-
-HEBREW TRANSLATION QUALITY RULES:
-5. Use NATURAL Hebrew expressions - never translate word-by-word literally
-6. Match proper Hebrew grammar: correct gender (זכר/נקבה), verb conjugation, and tense
-7. Use common everyday Hebrew vocabulary that native speakers actually use
-8. Preserve the original tone: casual speech stays casual, formal stays formal
-9. Translate idioms to their Hebrew equivalents, not literally (e.g., "break a leg" → "בהצלחה")
-10. Keep sentences concise - subtitles should be easy to read quickly
-11. For technical terms with no Hebrew equivalent, transliterate appropriately
-
-Example format:
-[1] תרגום ראשון
-[2] תרגום שני
-[3] תרגום שלישי"""
-            },
-            {
-                "role": "user",
-                "content": numbered_text
-            }
-        ]
+def _make_text_download_response(content: str, filename: str) -> Response:
+    """Return text content as a downloadable file response (no temp file)."""
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-    
-    # Track token usage
-    token_usage = {
-        "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-        "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-        "total_tokens": response.usage.total_tokens if response.usage else 0
-    }
-    
-    # Parse the numbered response back into a list
-    result_text = response.choices[0].message.content
-    
-    # Log input and output for analysis
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"translation_log_{timestamp}_chunk{chunk_num}.txt"
-    with open(log_file, "w", encoding="utf-8") as f:
-        f.write(f"=== CHUNK {chunk_num} ===\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Target language: {target_language}\n")
-        f.write(f"Number of segments: {len(texts)}\n")
-        f.write(f"Input tokens: {token_usage['prompt_tokens']}\n")
-        f.write(f"Output tokens: {token_usage['completion_tokens']}\n")
-        f.write(f"\n{'='*50}\n")
-        f.write("INPUT TEXT:\n")
-        f.write(f"{'='*50}\n")
-        f.write(numbered_text)
-        f.write(f"\n\n{'='*50}\n")
-        f.write("OUTPUT TEXT:\n")
-        f.write(f"{'='*50}\n")
-        f.write(result_text)
-        f.write(f"\n\n{'='*50}\n")
-    
-    print(f"    Logged to: {log_file}")
-    
-    translations = []
-    
-    # Try to extract translations by line number with improved regex
-    for i in range(len(texts)):
-        # Match [N] followed by content until next [N+1] or end
-        pattern = rf'\[{i+1}\]\s*(.+?)(?=\n\s*\[{i+2}\]|\n\s*\[\d+\]|$)'
-        match = re.search(pattern, result_text, re.DOTALL)
-        if match:
-            translation = match.group(1).strip()
-            # Clean up any trailing newlines or extra whitespace
-            translation = ' '.join(translation.split())
-            translations.append(translation)
-        else:
-            # Fallback: try to find by just looking for the number
-            simple_pattern = rf'\[{i+1}\]\s*([^\[\n]+)'
-            simple_match = re.search(simple_pattern, result_text)
-            if simple_match:
-                translations.append(simple_match.group(1).strip())
-            else:
-                # Last resort: use original text
-                print(f"Warning: Could not parse translation for segment {i+1}")
-                translations.append(texts[i])
-    
-    # Validation: ensure we have exactly the right number of translations
-    if len(translations) != len(texts):
-        print(f"ERROR: Translation count mismatch! Expected {len(texts)}, got {len(translations)}")
-    
-    # Log segment mapping for sync debugging
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write("\nSEGMENT MAPPING:\n")
-        f.write("="*50 + "\n")
-        for i, (orig, trans) in enumerate(zip(texts, translations), 1):
-            f.write(f"[{i}] ORIG: {orig[:50]}...\n")
-            f.write(f"[{i}] TRANS: {trans[:50]}...\n")
-            f.write("-"*30 + "\n")
-    
-    return translations, token_usage
 
 
-def batch_translate_ollama(texts: list, target_language: str, model: str = "llama3.2") -> list:
-    """Translate a batch of texts using Ollama in a single API call"""
-    if target_language.lower() == "english" or not texts:
-        return texts
-    
-    # Create numbered format for batch translation
-    numbered_text = "\n".join([f"[{i+1}] {text}" for i, text in enumerate(texts)])
-    
-    response = ollama.chat(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": f"""You are a professional subtitle translator. Translate each numbered line to {target_language}.
+# ============================================
+# Processing Pipeline
+# ============================================
 
-CRITICAL RULES:
-1. Keep the EXACT same numbering format: [1], [2], [3], etc.
-2. Each translation MUST start with its number in brackets on its own line
-3. Translate EVERY word - do not leave any English
-4. Keep the same meaning and tone
-5. Output ONLY the numbered translations, nothing else
-
-Example format:
-[1] תרגום ראשון
-[2] תרגום שני
-[3] תרגום שלישי"""
-            },
-            {
-                "role": "user",
-                "content": numbered_text
-            }
-        ]
-    )
-    
-    # Parse the numbered response back into a list
-    result_text = response['message']['content']
-    translations = []
-    
-    # Try to extract translations by line number with improved regex
-    for i in range(len(texts)):
-        # Match [N] followed by content until next [N+1] or end
-        pattern = rf'\[{i+1}\]\s*(.+?)(?=\n\s*\[{i+2}\]|\n\s*\[\d+\]|$)'
-        match = re.search(pattern, result_text, re.DOTALL)
-        if match:
-            translation = match.group(1).strip()
-            # Clean up any trailing newlines or extra whitespace
-            translation = ' '.join(translation.split())
-            translations.append(translation)
-        else:
-            # Fallback: try to find by just looking for the number
-            simple_pattern = rf'\[{i+1}\]\s*([^\[\n]+)'
-            simple_match = re.search(simple_pattern, result_text)
-            if simple_match:
-                translations.append(simple_match.group(1).strip())
-            else:
-                # Last resort: use original text
-                print(f"Warning: Could not parse translation for segment {i+1}")
-                translations.append(texts[i])
-    
-    return translations
-
-
-def generate_srt(segments: list, target_language: str, use_ollama: bool = False, ollama_model: str = "llama3.2") -> tuple:
-    """Generate SRT subtitle file content from transcription segments.
-    Returns (translated_srt, original_srt, token_usage) tuple."""
-    
-    # Extract all segment data first
-    segment_data = []
-    for segment in segments:
-        # Handle both object attributes and dictionary access
-        start = getattr(segment, 'start', None) or segment.get('start', 0) if isinstance(segment, dict) else segment.start
-        end = getattr(segment, 'end', None) or segment.get('end', 0) if isinstance(segment, dict) else segment.end
-        text_raw = getattr(segment, 'text', None) or segment.get('text', '') if isinstance(segment, dict) else segment.text
-        segment_data.append({
-            'start': start,
-            'end': end,
-            'text': text_raw.strip()
-        })
-    
-    # Build original SRT content (before translation)
-    original_srt_content = []
-    texts = [s['text'] for s in segment_data]
-    for i, seg in enumerate(segment_data, 1):
-        start_time = format_timestamp(seg['start'])
-        end_time = format_timestamp(seg['end'])
-        original_srt_content.append(f"{i}")
-        original_srt_content.append(f"{start_time} --> {end_time}")
-        original_srt_content.append(seg['text'])
-        original_srt_content.append("")
-    original_srt = "\n".join(original_srt_content)
-    
-    # Track total token usage
-    total_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    
-    # Batch translate all texts at once if needed (in chunks for very long videos)
-    if target_language.lower() != "english":
-        print(f"Batch translating {len(texts)} segments to {target_language}...")
-        
-        # Process in chunks of 75 segments (balance between speed and reliability)
-        CHUNK_SIZE = 50  # Smaller chunks to prevent LLM output token exhaustion
-        translated_texts = []
-        
-        for chunk_start in range(0, len(texts), CHUNK_SIZE):
-            chunk_end = min(chunk_start + CHUNK_SIZE, len(texts))
-            chunk = texts[chunk_start:chunk_end]
-            print(f"  Translating chunk {chunk_start + 1}-{chunk_end} of {len(texts)}...")
-            
-            if use_ollama:
-                chunk_translations = batch_translate_ollama(chunk, target_language, ollama_model)
-            else:
-                chunk_num = chunk_start // CHUNK_SIZE + 1
-                chunk_translations, chunk_tokens = batch_translate_openai(chunk, target_language, chunk_num)
-                total_tokens["prompt_tokens"] += chunk_tokens["prompt_tokens"]
-                total_tokens["completion_tokens"] += chunk_tokens["completion_tokens"]
-                total_tokens["total_tokens"] += chunk_tokens["total_tokens"]
-                translated_texts.extend(chunk_translations)
-                continue
-            
-            translated_texts.extend(chunk_translations)
-        
-        print("Batch translation complete!")
-    else:
-        translated_texts = texts
-    
-    # Build translated SRT content and structured segment data
-    srt_content = []
-    subtitles_data = []
-    for i, (seg, translated_text) in enumerate(zip(segment_data, translated_texts), 1):
-        start_time = format_timestamp(seg['start'])
-        end_time = format_timestamp(seg['end'])
-        
-        srt_content.append(f"{i}")
-        srt_content.append(f"{start_time} --> {end_time}")
-        srt_content.append(translated_text)
-        srt_content.append("")  # Empty line between entries
-        
-        # Store structured subtitle data for editing
-        subtitles_data.append({
-            "id": i,
-            "start": seg['start'],
-            "end": seg['end'],
-            "text": translated_text,
-            "original_text": seg['text']
-        })
-    
-    return "\n".join(srt_content), original_srt, total_tokens, subtitles_data
-
-
-def wrap_rtl(text: str) -> str:
-    """Wrap text with Unicode RTL embedding markers for proper RTL rendering"""
-    # RLE (Right-to-Left Embedding) at start, PDF (Pop Directional Formatting) at end
-    RLE = '\u202B'
-    PDF = '\u202C'
-    return f"{RLE}{text}{PDF}"
-
-
-def process_srt_for_rtl(srt_content: str) -> str:
-    """Process SRT content to add RTL markers for Hebrew text"""
-    new_blocks = []
-    blocks = srt_content.strip().split('\n\n')
-    
-    for block in blocks:
-        lines = block.split('\n')
-        if len(lines) >= 3:
-            # First two lines are ID and timing
-            header = lines[:2]
-            # Rest are text - wrap with RTL markers
-            text_lines = lines[2:]
-            processed_lines = [wrap_rtl(line) for line in text_lines]
-            new_blocks.append("\n".join(header + processed_lines))
-        else:
-            new_blocks.append(block)
-            
-    return "\n\n".join(new_blocks)
-
-
-def subtitles_to_srt(subtitles: list) -> str:
-    """Convert subtitles list back to SRT format."""
-    srt_content = []
-    for sub in subtitles:
-        start_time = format_timestamp(sub['start'])
-        end_time = format_timestamp(sub['end'])
-        srt_content.append(f"{sub['id']}")
-        srt_content.append(f"{start_time} --> {end_time}")
-        srt_content.append(sub['text'])
-        srt_content.append("")
-    return "\n".join(srt_content)
-
-
-def extract_audio(video_path: str, audio_path: str):
-    """Extract audio from video using FFmpeg with compression for Whisper API"""
-    cmd = [
-        "ffmpeg", "-i", video_path,
-        "-vn", "-acodec", "mp3",
-        "-ar", "16000",      # 16kHz sample rate (Whisper's native rate)
-        "-ac", "1",          # Mono audio
-        "-b:a", "64k",       # 64kbps bitrate (speech-optimized, keeps file under 25MB)
-        "-y", audio_path
-    ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        raise Exception(parse_ffmpeg_error(e.stderr.decode() if e.stderr else ""))
-
-
-def get_hebrew_font_path() -> str:
-    """Get the path to a Hebrew-compatible font based on the current OS."""
-    system = platform.system()
-    if system == "Darwin":
-        candidates = [
-            "/Library/Fonts/Arial Unicode.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/Library/Fonts/Arial.ttf",
-        ]
-    elif system == "Windows":
-        windir = os.environ.get("WINDIR", r"C:\Windows")
-        candidates = [
-            os.path.join(windir, "Fonts", "arialuni.ttf"),
-            os.path.join(windir, "Fonts", "arial.ttf"),
-            os.path.join(windir, "Fonts", "segoeui.ttf"),
-        ]
-    else:  # Linux
-        candidates = [
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    print(f"Warning: No Hebrew-compatible font found for {system}, tried: {candidates}")
-    return candidates[0]
-
-
-def embed_subtitles(video_path: str, srt_path: str, output_path: str, target_language: str):
-    """Embed subtitles and watermark into video using FFmpeg"""
-    hebrew_font = get_hebrew_font_path()
-    fonts_dir = os.path.dirname(hebrew_font)
-    fonts_dir_escaped = fonts_dir.replace("\\", "/").replace(":", "\\:")
-    style = "FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H40000000,BackColour=&H80000000,Outline=1,Shadow=2,Bold=0,MarginV=30"
-
-    srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "'\\''")
-    
-    wm = WATERMARK_CONFIG
-    logo_path = wm["logo_path"]
-    
-    if logo_path.exists():
-        logo_escaped = str(logo_path.absolute()).replace("\\", "/").replace(":", "\\:")
-        opacity = wm["opacity"]
-        logo_h = wm["logo_height"]
-        margin = wm["margin"]
-        eng_size = wm["english_font_size"]
-        heb_size = wm["hebrew_font_size"]
-        spacing = wm["text_spacing"]
-        eng_text = wm["english_text"]
-        heb_text = wm["hebrew_text"][::-1]  # Reverse for FFmpeg RTL fix
-
-        hebrew_font_escaped = hebrew_font.replace("\\", "/").replace(":", "\\\\:")
-        
-        filter_complex = (
-            f"[0:v]subtitles='{srt_escaped}':fontsdir='{fonts_dir_escaped}':force_style='{style}'[sub];"
-            f"[1:v]scale=-1:{logo_h},format=rgba,colorchannelmixer=aa={opacity}[logo];"
-            f"[sub]drawtext=text='{eng_text}':"
-            f"fontsize={eng_size}:fontcolor=white@{opacity}:"
-            f"x={logo_h}+{margin*2}:y={margin}:"
-            f"shadowcolor=black:shadowx=1:shadowy=1[text1];"
-            f"[text1]drawtext=text='{heb_text}':"
-            f"fontfile='{hebrew_font_escaped}':"
-            f"fontsize={heb_size}:fontcolor=white@{opacity}:"
-            f"x={logo_h}+{margin*2}:y={margin + spacing}:"
-            f"shadowcolor=black:shadowx=1:shadowy=1[text2];"
-            f"[text2][logo]overlay={margin}:{margin}[out]"
-        )
-        
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-i", str(logo_path.absolute()),
-            "-filter_complex", filter_complex,
-            "-map", "[out]",
-            "-map", "0:a",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-c:a", "copy",
-            "-movflags", "+faststart",
-            output_path
-        ]
-    else:
-        print(f"Warning: Logo not found at {logo_path}, watermark disabled")
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-vf", f"subtitles='{srt_escaped}':fontsdir='{fonts_dir_escaped}':force_style='{style}'",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-vsync", "passthrough",
-            "-c:a", "copy",
-            "-movflags", "+faststart",
-            output_path
-        ]
-    
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode() if e.stderr else 'No error message'
-        print(f"FFmpeg error: {error_msg}")
-        raise Exception(parse_ffmpeg_error(error_msg))
-
-
-def process_video(job_id: str, video_path: str, target_language: str, use_ollama: bool, ollama_model: str):
-    """Main processing pipeline"""
+def process_video(
+    job_id: str,
+    video_path: str,
+    target_language: str,
+    use_ollama: bool,
+    ollama_model: str,
+) -> None:
+    """Main processing pipeline."""
     start_time = time.time()
     temp_dir = None
-    
-    print(f"[process_video] Job {job_id} — Processing video at: {video_path}")
-    print(f"[process_video] File exists: {Path(video_path).exists()}, size: {Path(video_path).stat().st_size if Path(video_path).exists() else 'N/A'}")
-    
+
+    logger.info("Job %s — Processing video at: %s", job_id, video_path)
+    vp = Path(video_path)
+    logger.info("File exists: %s, size: %s", vp.exists(), vp.stat().st_size if vp.exists() else "N/A")
+
     try:
         with jobs_lock:
             jobs[job_id]["status"] = "extracting_audio"
             jobs[job_id]["progress"] = Progress.EXTRACTING_AUDIO
-        
-        # Create temp directory for this job
+
         temp_dir = tempfile.mkdtemp()
         audio_path = os.path.join(temp_dir, "audio.mp3")
         srt_path = os.path.join(temp_dir, "subtitles.srt")
         srt_path_burning = os.path.join(temp_dir, "subtitles_burning.srt")
-        
-        # Check for audio stream before extraction
-        audio_check = has_audio_stream(video_path)
-        print(f"[process_video] Audio stream check: {audio_check}")
-        if not audio_check:
+
+        # Check for audio stream
+        if not has_audio_stream(video_path):
             raise Exception("Video has no audio track. Cannot generate subtitles.")
-        
+
         # Step 1: Extract audio
         extract_audio(video_path, audio_path)
-        audio_size = Path(audio_path).stat().st_size if Path(audio_path).exists() else 0
-        print(f"[process_video] Extracted audio size: {audio_size} bytes")
-        if audio_size == 0:
-            raise Exception("Audio extraction produced empty file. Video may have incompatible codec.")
+        validate_audio_size(audio_path)
+
         with jobs_lock:
             jobs[job_id]["status"] = "transcribing"
             jobs[job_id]["progress"] = Progress.TRANSCRIBING
-        
+
         # Step 2: Transcribe with Whisper
-        transcript = transcribe_audio(audio_path)
+        transcript = transcribe_audio(openai_client, audio_path)
+
         with jobs_lock:
             jobs[job_id]["status"] = "translating"
             jobs[job_id]["progress"] = Progress.TRANSLATING
-        
+
         # Step 3: Generate SRT (with translation if needed)
         segments = transcript.segments if hasattr(transcript, 'segments') else transcript.get('segments', [])
         if not segments:
             raise Exception("No speech detected in video. Cannot generate subtitles.")
-        srt_content, original_srt_content, token_usage, subtitles_data = generate_srt(segments, target_language, use_ollama, ollama_model)
-        
+
+        srt_content, original_srt_content, token_usage, subtitles_data = generate_srt(
+            segments, target_language, openai_client, use_ollama, ollama_model
+        )
+
         # Save standard SRT for download
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
-            
-        # Prepare SRT for burning (Apply RTL markers if needed)
+
+        # Prepare SRT for burning (apply RTL markers if needed)
         if target_language.lower() == "hebrew":
             srt_content_burning = process_srt_for_rtl(srt_content)
             with open(srt_path_burning, "w", encoding="utf-8") as f:
@@ -709,62 +311,156 @@ def process_video(job_id: str, video_path: str, target_language: str, use_ollama
             burning_source = srt_path_burning
         else:
             burning_source = srt_path
-        
+
         with jobs_lock:
             jobs[job_id]["status"] = "embedding_subtitles"
             jobs[job_id]["progress"] = Progress.EMBEDDING
-        
+
         # Step 4: Embed subtitles
         output_filename = f"{job_id}_subtitled.mp4"
         output_path = OUTPUT_DIR / output_filename
-        embed_subtitles(video_path, burning_source, str(output_path), target_language)
-        
+        embed_subtitles(
+            video_path, burning_source, str(output_path), target_language, WATERMARK_CONFIG
+        )
+
         # Calculate elapsed time
-        elapsed_time = time.time() - start_time
-        elapsed_formatted = str(timedelta(seconds=int(elapsed_time)))
-        
-        with jobs_lock:
-            jobs[job_id]["status"] = "completed"
-            jobs[job_id]["progress"] = Progress.COMPLETED
-            jobs[job_id]["output_file"] = output_filename
-            jobs[job_id]["srt_content"] = srt_content
-            jobs[job_id]["original_srt_content"] = original_srt_content
-            jobs[job_id]["elapsed_time"] = elapsed_formatted
-            jobs[job_id]["elapsed_seconds"] = int(elapsed_time)
-            jobs[job_id]["token_usage"] = token_usage
-            jobs[job_id]["subtitles"] = subtitles_data
-            jobs[job_id]["edited"] = False
-        
-        print(f"Job {job_id} completed in {elapsed_formatted}")
-        
-        # Calculate cost based on gpt-5-nano pricing
-        # Input: $0.05 per 1M tokens, Output: $0.40 per 1M tokens
-        input_cost = (token_usage["prompt_tokens"] / 1_000_000) * 0.05
-        output_cost = (token_usage["completion_tokens"] / 1_000_000) * 0.40
+        elapsed = time.time() - start_time
+        elapsed_formatted = str(timedelta(seconds=int(elapsed)))
+
+        # Calculate cost (gpt-5-mini pricing)
+        input_cost = (token_usage["prompt_tokens"] / 1_000_000) * 0.40
+        output_cost = (token_usage["completion_tokens"] / 1_000_000) * 1.60
         total_cost = input_cost + output_cost
-        
         token_usage["input_cost"] = round(input_cost, 4)
         token_usage["output_cost"] = round(output_cost, 4)
         token_usage["total_cost"] = round(total_cost, 4)
-        
-        print(f"Token usage: Input={token_usage['prompt_tokens']:,} (${input_cost:.4f}) | Output={token_usage['completion_tokens']:,} (${output_cost:.4f}) | Total cost: ${total_cost:.4f}")
-        
-        # Cleanup temp files
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        
+
+        with jobs_lock:
+            jobs[job_id].update({
+                "status": "completed",
+                "progress": Progress.COMPLETED,
+                "output_file": output_filename,
+                "srt_content": srt_content,
+                "original_srt_content": original_srt_content,
+                "elapsed_time": elapsed_formatted,
+                "elapsed_seconds": int(elapsed),
+                "token_usage": token_usage,
+                "subtitles": subtitles_data,
+                "edited": False,
+            })
+
+        logger.info("Job %s completed in %s", job_id, elapsed_formatted)
+        logger.info(
+            "Token usage: Input=%s ($%.4f) | Output=%s ($%.4f) | Total: $%.4f",
+            f"{token_usage['prompt_tokens']:,}", input_cost,
+            f"{token_usage['completion_tokens']:,}", output_cost, total_cost
+        )
+
     except Exception as e:
-        elapsed_time = time.time() - start_time
+        elapsed = time.time() - start_time
         with jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = str(e)
-            jobs[job_id]["elapsed_seconds"] = int(elapsed_time)
-        print(f"Error processing video: {e}")
+            jobs[job_id]["elapsed_seconds"] = int(elapsed)
+        logger.error("Error processing video: %s", e)
     finally:
-        # Always cleanup temp files
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+
+def reburn_video_task(job_id: str) -> None:
+    """Background task to re-burn subtitles into video."""
+    temp_dir = None
+    try:
+        with jobs_lock:
+            job = jobs[job_id]
+            job["status"] = "reburning"
+            job["progress"] = Progress.REBURN_START
+
+        # Use trimmed video if available, otherwise find the original
+        trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
+        if trimmed_path.exists():
+            video_path = str(trimmed_path)
+        else:
+            video_path = find_video_path(job_id)
+
+        if not video_path or not Path(video_path).exists():
+            raise Exception("Video file not found")
+
+        with jobs_lock:
+            job["progress"] = Progress.REBURN_SRT
+
+        temp_dir = tempfile.mkdtemp()
+        srt_path = os.path.join(temp_dir, "subtitles.srt")
+
+        srt_content = subtitles_to_srt(job["subtitles"])
+
+        target_language = job.get("language", "english")
+        if target_language.lower() == "hebrew":
+            srt_content = process_srt_for_rtl(srt_content)
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+
+        with jobs_lock:
+            job["progress"] = Progress.REBURN_EMBED
+
+        output_filename = f"{job_id}_edited.mp4"
+        output_path = OUTPUT_DIR / output_filename
+
+        embed_subtitles(
+            video_path, srt_path, str(output_path), target_language, WATERMARK_CONFIG
+        )
+
+        with jobs_lock:
+            job["status"] = "completed"
+            job["progress"] = Progress.COMPLETED
+            job["output_file"] = output_filename
+
+    except Exception as e:
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = str(e)
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def download_video_task(job_id: str, url: str, quality: str) -> None:
+    """Background task for downloading video."""
+    try:
+        with jobs_lock:
+            jobs[job_id]["status"] = "downloading"
+            jobs[job_id]["progress"] = Progress.DOWNLOADING
+
+        def progress_callback(percent: float, status: str) -> None:
+            with jobs_lock:
+                jobs[job_id]["progress"] = min(int(percent * 0.9), 90)
+                jobs[job_id]["download_status"] = status
+
+        output_path = download_video_from_url(
+            url=url,
+            output_dir=DOWNLOAD_DIR,
+            job_id=job_id,
+            quality=quality,
+            progress_callback=progress_callback,
+        )
+
+        with jobs_lock:
+            jobs[job_id]["status"] = "downloaded"
+            jobs[job_id]["progress"] = Progress.COMPLETED
+            jobs[job_id]["video_path"] = str(output_path)
+            jobs[job_id]["download_status"] = "complete"
+
+    except Exception as e:
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = str(e)
+
+
+# ============================================
+# Upload Endpoints
+# ============================================
 
 @app.post("/upload")
 async def upload_video(
@@ -772,64 +468,43 @@ async def upload_video(
     video: UploadFile = File(...),
     language: str = Form(...),
     translation_service: str = Form("openai"),
-    ollama_model: str = Form("llama3.2")
+    ollama_model: str = Form("llama3.2"),
 ):
-    """Upload video and start processing"""
-    
-    # Validate file type
-    if not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+    """Upload video and start processing."""
+    if not video.filename or not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file.")
-    
-    # Generate job ID
+
     job_id = str(uuid.uuid4())[:8]
-    
-    # Save uploaded file
     video_path = UPLOAD_DIR / f"{job_id}_{video.filename}"
-    with open(video_path, "wb") as f:
-        content = await video.read()
-        f.write(content)
-    
-    # Initialize job status
+    await save_upload_chunked(video, video_path)
+
     jobs[job_id] = {
         "status": "queued",
         "progress": 0,
         "output_file": None,
         "error": None,
         "original_filename": video.filename,
+        "video_path": str(video_path),
         "language": language,
-        "created_at": datetime.now()
+        "created_at": datetime.now(),
     }
-    
-    # Start processing in background
+
     use_ollama = translation_service.lower() == "ollama"
-    background_tasks.add_task(
-        process_video, 
-        job_id, 
-        str(video_path), 
-        language, 
-        use_ollama, 
-        ollama_model
-    )
-    
+    background_tasks.add_task(process_video, job_id, str(video_path), language, use_ollama, ollama_model)
+
     return {"job_id": job_id, "message": "Video uploaded successfully. Processing started."}
 
 
 @app.post("/upload-only")
-async def upload_video_only(
-    video: UploadFile = File(...)
-):
+async def upload_video_only(video: UploadFile = File(...)):
     """Upload video without starting processing (for wizard flow)."""
-    
-    if not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+    if not video.filename or not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file.")
-    
+
     job_id = str(uuid.uuid4())[:8]
-    
     video_path = UPLOAD_DIR / f"{job_id}_{video.filename}"
-    with open(video_path, "wb") as f:
-        content = await video.read()
-        f.write(content)
-    
+    await save_upload_chunked(video, video_path)
+
     jobs[job_id] = {
         "status": "uploaded",
         "progress": 0,
@@ -838,11 +513,15 @@ async def upload_video_only(
         "original_filename": video.filename,
         "video_path": str(video_path),
         "source_type": "upload",
-        "created_at": datetime.now()
+        "created_at": datetime.now(),
     }
-    
+
     return {"job_id": job_id, "message": "Video uploaded successfully."}
 
+
+# ============================================
+# Processing Endpoints
+# ============================================
 
 class ProcessRequest(BaseModel):
     language: str = "English"
@@ -854,194 +533,106 @@ class ProcessRequest(BaseModel):
 async def process_existing_video(
     job_id: str,
     request: ProcessRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    job: dict = Depends(get_validated_job),
 ):
     """Start translation processing on an already downloaded/uploaded video."""
-    if not validate_job_id(job_id) or job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
     video_path = find_video_path(job_id)
-    
     if not video_path:
         raise HTTPException(status_code=404, detail="Video file not found. Upload or download a video first.")
-    
-    # Update job for processing
+
     job["status"] = "queued"
     job["progress"] = 0
     job["output_file"] = None
     job["error"] = None
     job["language"] = request.language
     job["original_filename"] = job.get("original_filename", Path(video_path).name)
-    
-    # Start processing in background
+
     use_ollama = request.translation_service.lower() == "ollama"
-    background_tasks.add_task(
-        process_video,
-        job_id,
-        video_path,
-        request.language,
-        use_ollama,
-        request.ollama_model
-    )
-    
+    background_tasks.add_task(process_video, job_id, video_path, request.language, use_ollama, request.ollama_model)
+
     return {"job_id": job_id, "message": "Processing started."}
 
 
 @app.get("/status/{job_id}")
-async def get_status(job_id: str):
-    """Get processing status"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+async def get_status(job_id: str, job: dict = Depends(get_validated_job)):
+    """Get processing status."""
+    return job
 
 
 @app.get("/download/{job_id}")
-async def download_video(job_id: str):
-    """Download processed video"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
+async def download_video(job_id: str, job: dict = Depends(get_validated_job)):
+    """Download processed video."""
     if job["status"] != "completed":
         raise HTTPException(status_code=400, detail="Video is not ready yet")
-    
+
     output_path = OUTPUT_DIR / job["output_file"]
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Output file not found")
-    
+
     return FileResponse(
         path=str(output_path),
         filename=f"subtitled_{job['original_filename']}",
-        media_type="video/mp4"
+        media_type="video/mp4",
     )
 
+
+# ============================================
+# Text Download Endpoints (StreamingResponse — no temp files)
+# ============================================
 
 @app.get("/download-srt/{job_id}")
-async def download_srt(job_id: str):
-    """Download SRT subtitle file"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
+async def download_srt(job_id: str, job: dict = Depends(get_validated_job)):
+    """Download SRT subtitle file."""
     if job["status"] != "completed":
         raise HTTPException(status_code=400, detail="Subtitles are not ready yet")
-    
-    srt_content = job.get("srt_content", "")
-    
-    # Create temp SRT file
-    srt_filename = f"{job_id}_subtitles.srt"
-    srt_path = OUTPUT_DIR / srt_filename
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write(srt_content)
-    
-    return FileResponse(
-        path=str(srt_path),
-        filename=f"subtitles_{Path(job['original_filename']).stem}.srt",
-        media_type="text/plain"
-    )
+    content = job.get("srt_content", "")
+    filename = f"subtitles_{Path(job['original_filename']).stem}.srt"
+    return _make_text_download_response(content, filename)
 
 
 @app.get("/download-transcription/{job_id}")
-async def download_transcription(job_id: str):
-    """Download original transcription SRT file (before translation)"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
+async def download_transcription(job_id: str, job: dict = Depends(get_validated_job)):
+    """Download original transcription SRT file (before translation)."""
     if job["status"] != "completed":
         raise HTTPException(status_code=400, detail="Transcription is not ready yet")
-    
-    original_content = job.get("original_srt_content", "")
-    if not original_content:
+    content = job.get("original_srt_content", "")
+    if not content:
         raise HTTPException(status_code=404, detail="Original transcription not available")
-    
-    # Create temp SRT file
-    srt_filename = f"{job_id}_transcription.srt"
-    srt_path = OUTPUT_DIR / srt_filename
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write(original_content)
-    
-    return FileResponse(
-        path=str(srt_path),
-        filename=f"transcription_{Path(job['original_filename']).stem}.srt",
-        media_type="text/plain"
-    )
-
-
-def srt_to_plain_text(srt_content: str) -> str:
-    """Convert SRT content to plain text (removes timestamps and numbering)"""
-    lines = []
-    blocks = srt_content.strip().split('\n\n')
-    
-    for block in blocks:
-        block_lines = block.split('\n')
-        if len(block_lines) >= 3:
-            # Skip first two lines (number and timestamp), take the rest
-            text_lines = block_lines[2:]
-            lines.extend(text_lines)
-    
-    return '\n'.join(lines)
+    filename = f"transcription_{Path(job['original_filename']).stem}.srt"
+    return _make_text_download_response(content, filename)
 
 
 @app.get("/download-srt-txt/{job_id}")
-async def download_srt_txt(job_id: str):
-    """Download translated subtitles as plain TXT file"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
+async def download_srt_txt(job_id: str, job: dict = Depends(get_validated_job)):
+    """Download translated subtitles as plain TXT file."""
     if job["status"] != "completed":
         raise HTTPException(status_code=400, detail="Subtitles are not ready yet")
-    
-    srt_content = job.get("srt_content", "")
-    plain_text = srt_to_plain_text(srt_content)
-    
-    # Create temp TXT file
-    txt_filename = f"{job_id}_subtitles.txt"
-    txt_path = OUTPUT_DIR / txt_filename
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(plain_text)
-    
-    return FileResponse(
-        path=str(txt_path),
-        filename=f"subtitles_{Path(job['original_filename']).stem}.txt",
-        media_type="text/plain"
-    )
+    content = srt_to_plain_text(job.get("srt_content", ""))
+    filename = f"subtitles_{Path(job['original_filename']).stem}.txt"
+    return _make_text_download_response(content, filename)
 
 
 @app.get("/download-transcription-txt/{job_id}")
-async def download_transcription_txt(job_id: str):
-    """Download original transcription as plain TXT file"""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
+async def download_transcription_txt(job_id: str, job: dict = Depends(get_validated_job)):
+    """Download original transcription as plain TXT file."""
     if job["status"] != "completed":
         raise HTTPException(status_code=400, detail="Transcription is not ready yet")
-    
-    original_content = job.get("original_srt_content", "")
-    if not original_content:
+    content = job.get("original_srt_content", "")
+    if not content:
         raise HTTPException(status_code=404, detail="Original transcription not available")
-    
-    plain_text = srt_to_plain_text(original_content)
-    
-    # Create temp TXT file
-    txt_filename = f"{job_id}_transcription.txt"
-    txt_path = OUTPUT_DIR / txt_filename
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(plain_text)
-    
-    return FileResponse(
-        path=str(txt_path),
-        filename=f"transcription_{Path(job['original_filename']).stem}.txt",
-        media_type="text/plain"
-    )
+    plain = srt_to_plain_text(content)
+    filename = f"transcription_{Path(job['original_filename']).stem}.txt"
+    return _make_text_download_response(plain, filename)
 
+
+# ============================================
+# Ollama
+# ============================================
 
 @app.get("/ollama-models")
 async def get_ollama_models():
-    """Get available Ollama models"""
+    """Get available Ollama models."""
     try:
         models = ollama.list()
         return {"models": [m['name'] for m in models.get('models', [])]}
@@ -1063,13 +654,8 @@ async def get_video_info_endpoint(url: str = Query(..., description="YouTube or 
     """Get video metadata without downloading."""
     if not url or not url.strip():
         raise HTTPException(status_code=400, detail="URL is required")
-    
     if not is_valid_url(url):
-        raise HTTPException(
-            status_code=400, 
-            detail="Invalid URL. Please provide a YouTube or X/Twitter video link."
-        )
-    
+        raise HTTPException(status_code=400, detail="Invalid URL. Please provide a YouTube or X/Twitter video link.")
     try:
         info = get_video_info(url)
         return {
@@ -1077,76 +663,32 @@ async def get_video_info_endpoint(url: str = Query(..., description="YouTube or 
             "duration": info.duration,
             "thumbnail": info.thumbnail,
             "source": info.source.value,
-            "video_id": info.video_id
+            "video_id": info.video_id,
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-def download_video_task(job_id: str, url: str, quality: str):
-    """Background task for downloading video."""
-    try:
-        with jobs_lock:
-            jobs[job_id]["status"] = "downloading"
-            jobs[job_id]["progress"] = Progress.DOWNLOADING
-        
-        def progress_callback(percent, status):
-            with jobs_lock:
-                jobs[job_id]["progress"] = min(int(percent * 0.9), 90)
-                jobs[job_id]["download_status"] = status
-        
-        output_path = download_video_from_url(
-            url=url,
-            output_dir=DOWNLOAD_DIR,
-            job_id=job_id,
-            quality=quality,
-            progress_callback=progress_callback
-        )
-        
-        with jobs_lock:
-            jobs[job_id]["status"] = "downloaded"
-            jobs[job_id]["progress"] = Progress.COMPLETED
-            jobs[job_id]["video_path"] = str(output_path)
-            jobs[job_id]["download_status"] = "complete"
-        
-    except Exception as e:
-        with jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = str(e)
-
-
 @app.post("/download-url")
-async def download_from_url(
-    background_tasks: BackgroundTasks,
-    request: DownloadRequest
-):
+async def download_from_url(background_tasks: BackgroundTasks, request: DownloadRequest):
     """Start downloading video from URL."""
     url = request.url.strip()
     quality = request.quality
-    
+
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
-    
     if not is_valid_url(url):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid URL. Please provide a YouTube or X/Twitter video link."
-        )
-    
-    # Validate quality
+        raise HTTPException(status_code=400, detail="Invalid URL. Please provide a YouTube or X/Twitter video link.")
     if quality not in ["720p", "1080p", "best"]:
         quality = "720p"
-    
-    # Get video info first
+
     try:
         info = get_video_info(url)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
-    # Generate job ID
+
     job_id = str(uuid.uuid4())[:8]
-    
-    # Initialize job status with enhanced fields
+
     jobs[job_id] = {
         "status": "queued",
         "progress": 0,
@@ -1158,58 +700,46 @@ async def download_from_url(
             "title": info.title,
             "duration": info.duration,
             "thumbnail": info.thumbnail,
-            "video_id": info.video_id
+            "video_id": info.video_id,
         },
         "video_path": None,
         "download_status": "pending",
-        "created_at": datetime.now()
+        "created_at": datetime.now(),
     }
-    
-    # Start download in background
+
     background_tasks.add_task(download_video_task, job_id, url, quality)
-    
+
     return {
         "job_id": job_id,
         "message": "Download started",
-        "video_info": jobs[job_id]["video_info"]
+        "video_info": jobs[job_id]["video_info"],
     }
 
 
 @app.get("/download-status/{job_id}")
-async def get_download_status(job_id: str):
+async def get_download_status(job_id: str, job: dict = Depends(get_validated_job)):
     """Get download progress status."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
     return {
         "status": job.get("status"),
         "progress": job.get("progress", 0),
         "download_status": job.get("download_status"),
         "error": job.get("error"),
         "video_info": job.get("video_info"),
-        "video_path": job.get("video_path")
+        "video_path": job.get("video_path"),
     }
 
 
 @app.get("/video-preview/{job_id}")
-async def preview_video(job_id: str):
+async def preview_video(job_id: str, _job: dict = Depends(get_validated_job)):
     """Stream video for HTML5 player preview."""
-    if not validate_job_id(job_id) or job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
     video_path = find_video_path(job_id)
-    
     if not video_path:
         raise HTTPException(status_code=404, detail="Video file not found")
-    
+
     return FileResponse(
         path=video_path,
         media_type="video/mp4",
-        headers={
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-cache"
-        }
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"},
     )
 
 
@@ -1223,16 +753,12 @@ class TrimRequest(BaseModel):
 
 
 @app.get("/video-duration/{job_id}")
-async def get_video_duration_endpoint(job_id: str):
+async def get_video_duration_endpoint(job_id: str, _job: dict = Depends(get_validated_job)):
     """Get video duration for trimming UI."""
-    if not validate_job_id(job_id) or job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
     video_path = find_video_path(job_id)
-    
     if not video_path:
         raise HTTPException(status_code=404, detail="Video file not found")
-    
+
     try:
         duration = get_video_duration(video_path)
         file_info = get_video_file_info(video_path)
@@ -1241,28 +767,22 @@ async def get_video_duration_endpoint(job_id: str):
             "width": file_info.get("width"),
             "height": file_info.get("height"),
             "fps": file_info.get("fps"),
-            "size_bytes": file_info.get("size_bytes")
+            "size_bytes": file_info.get("size_bytes"),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/trim/{job_id}")
-async def trim_video_endpoint(job_id: str, request: TrimRequest):
+async def trim_video_endpoint(job_id: str, request: TrimRequest, job: dict = Depends(get_validated_job)):
     """Trim video to specified time range."""
-    if not validate_job_id(job_id) or job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
     video_path = find_video_path(job_id)
-    
     if not video_path:
         raise HTTPException(status_code=404, detail="Video file not found")
-    
+
     start_time = request.start_time
     end_time = request.end_time
-    
-    # Validate times
+
     try:
         duration = get_video_duration(video_path)
         if start_time < 0:
@@ -1271,64 +791,53 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest):
             end_time = duration
         if end_time <= start_time:
             raise HTTPException(status_code=400, detail="End time must be greater than start time")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-    # Create trimmed file path
+
     trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
-    
+
     try:
         trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=True)
-        
-        # Verify trimmed file has audio
+
         if not has_audio_stream(str(trimmed_path)):
-            print(f"[trim] WARNING: Trimmed file lost audio track, retrying with explicit audio copy")
+            logger.warning("Trimmed file lost audio track, retrying")
             trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=True)
-        
-        # Update job with trim info
+
         job["original_video"] = video_path
         job["video_path"] = str(trimmed_path)
         job["trim_start"] = start_time
         job["trim_end"] = end_time
         job["trimmed"] = True
-        
+
         return {
             "message": "Video trimmed successfully",
             "trimmed_path": str(trimmed_path),
             "start_time": start_time,
             "end_time": end_time,
-            "duration": end_time - start_time
+            "duration": end_time - start_time,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/skip-trim/{job_id}")
-async def skip_trim(job_id: str):
+async def skip_trim(job_id: str, job: dict = Depends(get_validated_job)):
     """Skip trimming and use original video."""
-    if not validate_job_id(job_id) or job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
     video_path = find_video_path(job_id)
-    
     if not video_path:
         raise HTTPException(status_code=404, detail="Video file not found")
-    
-    # Ensure job has the path stored
+
     job["video_path"] = video_path
-    
+
     try:
         duration = get_video_duration(video_path)
         job["trim_start"] = 0
         job["trim_end"] = duration
         job["trimmed"] = False
-        
-        return {
-            "message": "Trimming skipped",
-            "video_path": video_path,
-            "duration": duration
-        }
+
+        return {"message": "Trimming skipped", "video_path": video_path, "duration": duration}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1347,147 +856,65 @@ class SubtitlesUpdateRequest(BaseModel):
 
 
 @app.get("/subtitles/{job_id}")
-async def get_subtitles(job_id: str):
+async def get_subtitles(job_id: str, job: dict = Depends(get_validated_job)):
     """Get subtitle segments for editing."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
-    
     if job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Job is not completed yet")
-    
+
     subtitles = job.get("subtitles", [])
     if not subtitles:
         raise HTTPException(status_code=404, detail="No subtitles found for this job")
-    
+
     return {
         "subtitles": subtitles,
         "language": job.get("language"),
         "edited": job.get("edited", False),
-        "count": len(subtitles)
+        "count": len(subtitles),
     }
 
 
 @app.put("/subtitles/{job_id}")
-async def update_subtitles(job_id: str, request: SubtitlesUpdateRequest):
+async def update_subtitles(job_id: str, request: SubtitlesUpdateRequest, job: dict = Depends(get_validated_job)):
     """Update subtitle text (for editing before re-burn)."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
-    
     if job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Job is not completed yet")
-    
+
     subtitles = job.get("subtitles", [])
     if not subtitles:
         raise HTTPException(status_code=404, detail="No subtitles found for this job")
-    
-    # Create a lookup for quick updates
+
     subtitles_dict = {s["id"]: s for s in subtitles}
-    
+
     updated_count = 0
     for update in request.subtitles:
         if update.id in subtitles_dict:
             subtitles_dict[update.id]["text"] = update.text
             updated_count += 1
-    
-    # Rebuild subtitles list maintaining order
+
     job["subtitles"] = [subtitles_dict[s["id"]] for s in subtitles]
     job["edited"] = True
-    
-    # Rebuild SRT content from updated subtitles
     job["srt_content"] = subtitles_to_srt(job["subtitles"])
-    
+
     return {
         "message": f"Updated {updated_count} subtitle(s)",
         "updated_count": updated_count,
-        "total_count": len(subtitles)
+        "total_count": len(subtitles),
     }
-
-
-def reburn_video_task(job_id: str):
-    """Background task to re-burn subtitles into video."""
-    temp_dir = None
-    try:
-        with jobs_lock:
-            job = jobs[job_id]
-            job["status"] = "reburning"
-            job["progress"] = Progress.REBURN_START
-        
-        # Use trimmed video if available, otherwise find the original
-        trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
-        if trimmed_path.exists():
-            video_path = str(trimmed_path)
-        else:
-            video_path = find_video_path(job_id)
-        
-        if not video_path or not Path(video_path).exists():
-            raise Exception("Video file not found")
-        
-        with jobs_lock:
-            job["progress"] = Progress.REBURN_SRT
-        
-        # Create temp SRT file from updated subtitles
-        temp_dir = tempfile.mkdtemp()
-        srt_path = os.path.join(temp_dir, "subtitles.srt")
-        
-        srt_content = subtitles_to_srt(job["subtitles"])
-        
-        # Apply RTL markers if Hebrew
-        target_language = job.get("language", "english")
-        if target_language.lower() == "hebrew":
-            srt_content = process_srt_for_rtl(srt_content)
-        
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write(srt_content)
-        
-        with jobs_lock:
-            job["progress"] = Progress.REBURN_EMBED
-        
-        # Re-embed subtitles
-        output_filename = f"{job_id}_edited.mp4"
-        output_path = OUTPUT_DIR / output_filename
-        
-        embed_subtitles(video_path, srt_path, str(output_path), target_language)
-        
-        with jobs_lock:
-            job["status"] = "completed"
-            job["progress"] = Progress.COMPLETED
-            job["output_file"] = output_filename
-        
-    except Exception as e:
-        with jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = str(e)
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.post("/reburn/{job_id}")
-async def reburn_video(job_id: str, background_tasks: BackgroundTasks):
+async def reburn_video(job_id: str, background_tasks: BackgroundTasks, job: dict = Depends(get_validated_job)):
     """Re-embed edited subtitles into video."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
-    
-    if job.get("status") not in ["completed"]:
+    if job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Job must be completed before re-burning")
-    
+
     subtitles = job.get("subtitles", [])
     if not subtitles:
         raise HTTPException(status_code=400, detail="No subtitles to burn")
-    
-    # Start re-burn in background
+
     background_tasks.add_task(reburn_video_task, job_id)
-    
-    return {
-        "message": "Re-burning started",
-        "job_id": job_id
-    }
+
+    return {"message": "Re-burning started", "job_id": job_id}
 
 
 # Mount static files

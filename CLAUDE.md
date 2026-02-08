@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-SubtitleAI is a web-based video subtitle generator. Users upload videos or paste YouTube/X URLs, the app transcribes audio with OpenAI Whisper, translates with GPT-5-nano, and burns subtitles + a branded watermark into the video using FFmpeg.
+SubtitleAI is a web-based video subtitle generator. Users upload videos or paste YouTube/X URLs, the app transcribes audio with OpenAI Whisper, translates with GPT-5-mini, and burns subtitles + a branded watermark into the video using FFmpeg.
 
 ## Running the App
 
@@ -22,15 +22,16 @@ source venv/bin/activate && python app.py
 
 Server starts at `http://127.0.0.1:8000`. Requires Python 3.10+, FFmpeg in PATH, and `OPENAI_API_KEY` in `.env`.
 
-There are no automated tests.
+Run tests with `pytest tests/ -v`.
 
 ## Architecture
 
-**Single-page app** with a FastAPI backend (`app.py`) and vanilla JS frontend (`static/`).
+**Single-page app** with a FastAPI backend and vanilla JS frontend (`static/`).
 
 ### Backend (Python)
 
-- **`app.py`** — The entire backend: FastAPI routes (~20 endpoints), job management, video processing pipeline, translation service, subtitle generation, watermark embedding. All state is in-memory (`jobs` dict protected by `threading.Lock`).
+- **`app.py`** — FastAPI routes (~20 endpoints), job management, upload handling, and background task orchestration. All state is in-memory (`jobs` dict protected by `threading.Lock`).
+- **`processing.py`** — Video processing pipeline: transcription (Whisper), translation (OpenAI/Ollama), SRT generation, RTL support, FFmpeg subtitle embedding and watermark overlay.
 - **`downloader.py`** — yt-dlp wrapper for downloading from YouTube and X/Twitter.
 - **`trimmer.py`** — FFmpeg wrapper for video trimming with re-encode support.
 
@@ -44,7 +45,7 @@ There are no automated tests.
 
 ```
 Video Input → Extract Audio (FFmpeg, 16kHz mono MP3)
-  → Whisper API transcription → GPT-5-nano translation (batched, 75 segments/chunk)
+  → Whisper API transcription → GPT-5-mini translation (batched, 50 segments/chunk)
   → Generate SRT → FFmpeg embed subtitles + watermark → Output MP4
 ```
 
@@ -59,13 +60,15 @@ All stored by job ID (UUID). Jobs auto-expire after 24 hours.
 
 ## Key Conventions
 
-- **Translation model**: Always use `gpt-5-nano` with `reasoning_effort="low"` and `max_completion_tokens=2000`. Do not change the model unless explicitly asked.
-- **GPT-5-nano pricing**: Input $0.05/1M tokens, Output $0.40/1M tokens.
+- **Translation model**: Always use `gpt-5-mini` with `reasoning_effort="low"` and `max_completion_tokens=10000`. Do not change the model unless explicitly asked.
+- **GPT-5-mini pricing**: Input $0.40/1M tokens, Output $1.60/1M tokens.
 - **RTL handling**: Hebrew text uses bidi markers (`\u202B`/`\u202C`) for subtitles and reversed character order for FFmpeg drawtext.
 - **Watermark**: Logo + bilingual text (@FinancialEduX / המחנך הפיננסי) at 70% opacity, upper-right corner. Config is `WATERMARK_CONFIG` dict in `app.py`.
 - **Job IDs**: UUID format, validated with `JOB_ID_PATTERN` regex for path traversal protection.
 - **FFmpeg patterns**: Use `-ss` before `-i` for fast seeking. Subtitle embedding uses `filter_complex` chaining: subtitles → drawtext → drawtext → overlay.
-- **Font resolution**: Cross-platform Hebrew font lookup in `find_hebrew_font()` — checks macOS, Linux, and Windows paths.
+- **Font resolution**: Cross-platform Hebrew font lookup in `get_hebrew_font_path()` (in `processing.py`) — checks macOS, Linux, and Windows paths.
+- **Upload limit**: 500MB max, streamed in 1MB chunks (no full-file memory load).
+- **FFmpeg timeouts**: All subprocess calls have timeouts (10-30 min) to prevent zombie jobs.
 
 ## Development Rules
 

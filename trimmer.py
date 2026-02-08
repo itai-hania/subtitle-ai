@@ -3,9 +3,15 @@ Video Trimmer Module
 Handles video trimming using FFmpeg
 """
 
+import logging
 import subprocess
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Timeout for trimming operations (seconds)
+TRIM_TIMEOUT = 600  # 10 minutes
 
 
 def get_video_duration(video_path: str) -> float:
@@ -34,9 +40,11 @@ def get_video_duration(video_path: str) -> float:
     ]
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
         duration = float(result.stdout.strip())
         return duration
+    except subprocess.TimeoutExpired:
+        raise Exception("Timed out getting video duration")
     except subprocess.CalledProcessError as e:
         raise Exception(f"Failed to get video duration: {e.stderr}")
     except ValueError:
@@ -127,8 +135,10 @@ def trim_video(
         ]
     
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(cmd, check=True, capture_output=True, timeout=TRIM_TIMEOUT)
         return output_path
+    except subprocess.TimeoutExpired:
+        raise Exception("Video trimming timed out. The video may be too long or complex.")
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.decode() if e.stderr else "Unknown error"
         raise Exception(f"Failed to trim video: {error_msg}")
@@ -160,7 +170,7 @@ def get_video_info(video_path: str) -> dict:
     
     try:
         import json
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
         data = json.loads(result.stdout)
         
         stream = data.get("streams", [{}])[0]
