@@ -55,6 +55,7 @@ Video Input → Extract Audio (FFmpeg, 16kHz mono MP3)
 - `downloads/` — yt-dlp downloaded videos
 - `outputs/` — Processed videos with subtitles
 - `logs/` — Translation debug logs
+- `docs/` — Specs, plans, and design documents
 
 All stored by job ID (UUID). Jobs auto-expire after 24 hours.
 
@@ -76,6 +77,7 @@ All stored by job ID (UUID). Jobs auto-expire after 24 hours.
 
 - Before implementing any feature or fix, think through the approach first. Identify which files are affected, what the edge cases are, and how it integrates with existing code.
 - For non-trivial changes, outline the plan before writing code.
+- Place specs and implementation plans in `docs/` (e.g., `docs/SPEC.md`, `docs/PLAN.md`).
 
 ### Keep It Simple
 
