@@ -8,6 +8,7 @@ venv/
 # Project specific
 logs/
 uploads/
+downloads/
 outputs/
 temp/
 *.mp4
