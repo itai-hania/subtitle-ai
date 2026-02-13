@@ -800,10 +800,63 @@ body {
     font-size: 0.95rem;
 }
 
+.trim-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.btn-play-selection {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    border: 2px solid var(--accent-primary);
+    background: rgba(99, 102, 241, 0.15);
+    color: var(--accent-primary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: all 0.2s;
+    font-size: 0.7rem;
+}
+
+.btn-play-selection:hover {
+    background: rgba(99, 102, 241, 0.3);
+}
+
+.btn-play-selection.playing {
+    border-color: var(--warning);
+    background: rgba(245, 158, 11, 0.2);
+    color: var(--warning);
+}
+
+.btn-play-selection.playing:hover {
+    background: rgba(245, 158, 11, 0.35);
+}
+
+.play-icon {
+    line-height: 1;
+}
+
+.trim-position-label {
+    color: var(--text-secondary);
+    font-weight: 500;
+    font-size: 0.9rem;
+    font-family: 'Courier New', monospace;
+}
+
+.trim-position-sep {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
 .trim-duration-label {
     color: var(--accent-primary);
     font-weight: 500;
     font-size: 0.9rem;
+    font-family: 'Courier New', monospace;
 }
 
 .trim-slider-container {
@@ -829,11 +882,31 @@ body {
 .trim-slider {
     position: relative;
     height: 50px;
-    background: rgba(0, 0, 0, 0.5);
+    background: transparent;
     border-radius: var(--radius-sm);
     cursor: pointer;
     margin-top: -54px;
     z-index: 2;
+}
+
+.trim-overlay-left,
+.trim-overlay-right {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.65);
+    pointer-events: none;
+    z-index: 0;
+}
+
+.trim-overlay-left {
+    left: 0;
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+
+.trim-overlay-right {
+    right: 0;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 
 .trim-range {

@@ -19,6 +19,7 @@ let trimEnd = 0;
 let videoDuration = 0;
 let subtitles = [];
 let hasEdits = false;
+let trimPlaybackActive = false;
 
 // ============================================
 // DOM Elements
@@ -85,6 +86,10 @@ const trimEndTime = document.getElementById('trim-end-time');
 const trimDurationEl = document.getElementById('trim-duration');
 const trimThumbnails = document.getElementById('trim-thumbnails');
 const trimPlayhead = document.getElementById('trim-playhead');
+const trimOverlayLeft = document.getElementById('trim-overlay-left');
+const trimOverlayRight = document.getElementById('trim-overlay-right');
+const btnPlaySelection = document.getElementById('btn-play-selection');
+const trimPositionEl = document.getElementById('trim-position');
 
 // Export section
 const exportSection = document.getElementById('export-section');
@@ -116,16 +121,20 @@ function setPanelState(state) {
     switch (state) {
         case 'source':
             panelSource.style.display = 'flex';
+            trimPlaybackActive = true;
             break;
         case 'downloading':
             panelDownloading.style.display = 'flex';
+            trimPlaybackActive = true;
             break;
         case 'processing':
             panelProcessing.style.display = 'flex';
             processingError.style.display = 'none';
+            trimPlaybackActive = false;
             break;
         case 'editor':
             panelEditor.style.display = 'flex';
+            trimPlaybackActive = false;
             break;
     }
 }
@@ -202,6 +211,7 @@ async function fetchAndShowDuration() {
     videoDuration = data.duration;
     trimStart = 0;
     trimEnd = videoDuration;
+    trimPlaybackActive = true;
     updateTrimUI();
     trimSection.style.display = 'block';
 }
@@ -606,6 +616,7 @@ function startStatusPolling() {
 
                 // Hide trim section — no longer needed
                 trimSection.style.display = 'none';
+                trimPlaybackActive = false;
 
                 // Reload video with burned-in subtitles
                 studioVideo.src = `/video-preview/${currentJobId}?t=${Date.now()}`;
@@ -743,6 +754,18 @@ function setupSubtitleSync() {
 
 function onVideoTimeUpdate() {
     const t = studioVideo.currentTime;
+
+    // Clamp playback to trim region
+    if (trimPlaybackActive && videoDuration > 0) {
+        if (t >= trimEnd) {
+            studioVideo.pause();
+            studioVideo.currentTime = trimStart;
+            syncPlaySelectionButton();
+        } else if (t < trimStart && !studioVideo.paused) {
+            studioVideo.currentTime = trimStart;
+        }
+    }
+
     const current = subtitles.find(s => t >= s.start && t <= s.end);
 
     if (current) {
@@ -762,6 +785,12 @@ function onVideoTimeUpdate() {
     // Update trim playhead
     if (videoDuration > 0) {
         trimPlayhead.style.left = `${(t / videoDuration) * 100}%`;
+    }
+
+    // Update position display
+    if (trimPlaybackActive && videoDuration > 0) {
+        const posInTrim = Math.max(0, Math.min(t - trimStart, trimEnd - trimStart));
+        trimPositionEl.textContent = formatTimePrecise(posInTrim);
     }
 }
 
@@ -890,9 +919,19 @@ function updateTrimUI() {
     trimRange.style.left = `${sp}%`;
     trimRange.style.right = `${100 - ep}%`;
 
+    // Dimming overlays
+    trimOverlayLeft.style.width = `${sp}%`;
+    trimOverlayRight.style.left = `${ep}%`;
+    trimOverlayRight.style.width = `${100 - ep}%`;
+
     trimStartTime.value = formatTimePrecise(trimStart);
     trimEndTime.value = formatTimePrecise(trimEnd);
-    trimDurationEl.textContent = `Duration: ${formatTimePrecise(trimEnd - trimStart)}`;
+    trimDurationEl.textContent = formatTimePrecise(trimEnd - trimStart);
+
+    // Update position display
+    const t = studioVideo.currentTime;
+    const posInTrim = Math.max(0, Math.min(t - trimStart, trimEnd - trimStart));
+    trimPositionEl.textContent = formatTimePrecise(posInTrim);
 }
 
 // Trim drag
@@ -933,12 +972,14 @@ function startTrimDrag(handle, e) {
 trimHandleStart.addEventListener('mousedown', (e) => startTrimDrag('start', e));
 trimHandleEnd.addEventListener('mousedown', (e) => startTrimDrag('end', e));
 
-// Click slider to seek
+// Click slider to seek (clamped to trim region)
 trimSlider.addEventListener('click', (e) => {
     if (e.target.closest('.trim-handle')) return;
     const rect = trimSlider.getBoundingClientRect();
     let pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    studioVideo.currentTime = pct * videoDuration;
+    let seekTime = pct * videoDuration;
+    seekTime = Math.max(trimStart, Math.min(seekTime, trimEnd));
+    studioVideo.currentTime = seekTime;
 });
 
 // Keyboard controls
@@ -995,6 +1036,36 @@ trimEndTime.addEventListener('change', () => {
     } else {
         trimEndTime.value = formatTimePrecise(trimEnd);
     }
+});
+
+// Play Selection button
+function syncPlaySelectionButton() {
+    const isPlaying = !studioVideo.paused;
+    btnPlaySelection.classList.toggle('playing', isPlaying);
+    btnPlaySelection.querySelector('.play-icon').textContent = isPlaying ? '⏸' : '▶';
+}
+
+btnPlaySelection.addEventListener('click', () => {
+    if (!studioVideo.paused) {
+        studioVideo.pause();
+    } else {
+        // If outside trim bounds or at trim end, seek to start
+        if (studioVideo.currentTime < trimStart || studioVideo.currentTime >= trimEnd) {
+            studioVideo.currentTime = trimStart;
+        }
+        studioVideo.play();
+    }
+    syncPlaySelectionButton();
+});
+
+// Sync button state when video pauses/plays externally
+studioVideo.addEventListener('pause', syncPlaySelectionButton);
+studioVideo.addEventListener('play', () => {
+    // If playing outside trim bounds, seek to start
+    if (trimPlaybackActive && (studioVideo.currentTime < trimStart || studioVideo.currentTime >= trimEnd)) {
+        studioVideo.currentTime = trimStart;
+    }
+    syncPlaySelectionButton();
 });
 
 // Thumbnail generation
@@ -1070,6 +1141,8 @@ function resetApp() {
     videoDuration = 0;
     subtitles = [];
     hasEdits = false;
+    trimPlaybackActive = false;
+    syncPlaySelectionButton();
 
     clearAllIntervals();
 

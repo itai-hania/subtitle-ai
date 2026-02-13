@@ -206,11 +206,20 @@
         <div class="trim-section" id="trim-section" style="display: none;">
             <div class="trim-header">
                 <span class="trim-label">✂️ Trim Clip</span>
-                <span id="trim-duration" class="trim-duration-label">Duration: --:--</span>
+                <div class="trim-header-right">
+                    <button class="btn-play-selection" id="btn-play-selection" title="Play Selection">
+                        <span class="play-icon">▶</span>
+                    </button>
+                    <span id="trim-position" class="trim-position-label">0:00</span>
+                    <span class="trim-position-sep">/</span>
+                    <span id="trim-duration" class="trim-duration-label">--:--</span>
+                </div>
             </div>
             <div class="trim-slider-container">
                 <div class="trim-thumbnails" id="trim-thumbnails"></div>
                 <div class="trim-slider" id="trim-slider">
+                    <div class="trim-overlay-left" id="trim-overlay-left"></div>
+                    <div class="trim-overlay-right" id="trim-overlay-right"></div>
                     <div class="trim-range" id="trim-range"></div>
                     <div class="trim-handle trim-handle-start" id="trim-handle-start">
                         <div class="trim-handle-line"></div>
