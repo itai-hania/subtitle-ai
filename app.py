@@ -11,13 +11,14 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import ollama
 import openai
-from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import (
     BackgroundTasks,
@@ -27,12 +28,14 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from downloader import (
     download_video as download_video_from_url,
@@ -55,8 +58,37 @@ from trimmer import get_video_duration, get_video_info as get_video_file_info, t
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Valid job ID pattern (alphanumeric and hyphens only)
-JOB_ID_PATTERN = re.compile(r'^[a-zA-Z0-9-]{1,36}$')
+# Valid job ID pattern (full UUID: 8-4-4-4-12 hex digits)
+JOB_ID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+# Allowed target languages for translation (prevents LLM prompt injection)
+ALLOWED_LANGUAGES = {
+    "english", "hebrew", "spanish", "french", "german", "italian",
+    "portuguese", "russian", "chinese", "japanese", "korean", "arabic",
+    "turkish", "dutch", "polish", "swedish", "norwegian", "danish",
+    "finnish", "greek", "czech", "romanian", "hungarian", "thai",
+    "vietnamese", "indonesian", "malay", "hindi", "bengali", "ukrainian",
+}
+
+# Allowed translation services
+ALLOWED_TRANSLATION_SERVICES = {"openai", "ollama"}
+
+# Allowed Ollama models
+ALLOWED_OLLAMA_MODELS = {
+    "llama3.2", "llama3.1", "llama3", "llama2",
+    "mistral", "mixtral", "gemma", "gemma2",
+    "phi3", "phi", "qwen2", "qwen",
+    "command-r", "aya",
+}
+
+# Allowed download qualities
+ALLOWED_QUALITIES = {"720p", "1080p", "best"}
+
+# Max concurrent jobs
+MAX_CONCURRENT_JOBS = 100
+
+# Safe filename pattern: alphanumeric, hyphens, underscores, dots
+SAFE_FILENAME_PATTERN = re.compile(r'[^a-zA-Z0-9._-]')
 
 load_dotenv()
 
@@ -79,7 +111,37 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 
-app = FastAPI(title="Video Subtitle Generator", lifespan=lifespan)
+app = FastAPI(
+    title="Video Subtitle Generator",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: blob: https://*.ytimg.com https://*.twimg.com; "
+            "media-src 'self' blob:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'"
+        )
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # CORS middleware — restrict to same-origin (no wildcard with credentials)
 app.add_middleware(
@@ -87,7 +149,7 @@ app.add_middleware(
     allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Accept"],
 )
 
 # Directories
@@ -115,6 +177,48 @@ WATERMARK_CONFIG = {
 jobs: dict = {}
 jobs_lock = threading.Lock()
 
+
+# ============================================
+# Rate Limiting
+# ============================================
+
+class RateLimiter:
+    """Simple in-memory per-IP rate limiter."""
+
+    def __init__(self) -> None:
+        self._requests: dict[str, list[float]] = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def check(self, key: str, max_requests: int, window_seconds: int = 60) -> bool:
+        """Return True if request is allowed, False if rate limited."""
+        now = time.time()
+        cutoff = now - window_seconds
+        with self._lock:
+            # Prune old entries
+            self._requests[key] = [t for t in self._requests[key] if t > cutoff]
+            if len(self._requests[key]) >= max_requests:
+                return False
+            self._requests[key].append(now)
+            return True
+
+
+rate_limiter = RateLimiter()
+
+
+def get_client_ip(request: Request) -> str:
+    """Extract client IP from request."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def check_rate_limit(request: Request, max_requests: int = 10) -> None:
+    """Check rate limit and raise 429 if exceeded."""
+    client_ip = get_client_ip(request)
+    if not rate_limiter.check(client_ip, max_requests):
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+
 # Job expiration
 JOB_TTL = timedelta(hours=24)
 
@@ -133,8 +237,13 @@ class Progress:
     COMPLETED = 100
 
 
+# Fail fast if API key is missing
+_openai_api_key = os.getenv("OPENAI_API_KEY")
+if not _openai_api_key:
+    raise RuntimeError("OPENAI_API_KEY environment variable is not set. Add it to .env file.")
+
 # OpenAI client
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = openai.OpenAI(api_key=_openai_api_key)
 
 
 # ============================================
@@ -213,6 +322,49 @@ def cleanup_old_jobs() -> None:
         logger.info("Cleaned up %d expired job(s)", len(expired))
 
 
+def sanitize_filename(filename: str) -> str:
+    """Strip directory components and restrict to safe characters."""
+    # Take only the basename (strip any directory traversal)
+    name = Path(filename).name
+    # Replace unsafe characters with underscores
+    name = SAFE_FILENAME_PATTERN.sub('_', name)
+    # Collapse multiple underscores
+    name = re.sub(r'_+', '_', name).strip('_')
+    # Ensure non-empty
+    if not name or name == '.':
+        name = "upload.mp4"
+    return name
+
+
+def validate_path_containment(path: Path, allowed_dir: Path) -> None:
+    """Ensure resolved path stays within the allowed directory."""
+    resolved = path.resolve()
+    allowed_resolved = allowed_dir.resolve()
+    if not str(resolved).startswith(str(allowed_resolved) + os.sep) and resolved != allowed_resolved:
+        raise HTTPException(status_code=400, detail="Invalid file path")
+
+
+def validate_language(language: str) -> str:
+    """Validate language against allowlist."""
+    if language.lower() not in ALLOWED_LANGUAGES:
+        raise HTTPException(status_code=400, detail=f"Unsupported language: {language}")
+    return language
+
+
+def validate_translation_service(service: str) -> str:
+    """Validate translation service against allowlist."""
+    if service.lower() not in ALLOWED_TRANSLATION_SERVICES:
+        raise HTTPException(status_code=400, detail=f"Unsupported translation service: {service}")
+    return service
+
+
+def validate_ollama_model(model: str) -> str:
+    """Validate Ollama model against allowlist."""
+    if model.lower() not in ALLOWED_OLLAMA_MODELS:
+        raise HTTPException(status_code=400, detail=f"Unsupported Ollama model: {model}")
+    return model
+
+
 async def save_upload_chunked(upload: UploadFile, dest: Path) -> int:
     """Write an UploadFile to disk in 1MB chunks. Returns bytes written."""
     total = 0
@@ -235,10 +387,11 @@ async def save_upload_chunked(upload: UploadFile, dest: Path) -> int:
 
 def _make_text_download_response(content: str, filename: str) -> Response:
     """Return text content as a downloadable file response (no temp file)."""
+    safe_name = sanitize_filename(filename)
     return Response(
         content=content.encode("utf-8"),
         media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
     )
 
 
@@ -358,11 +511,18 @@ def process_video(
 
     except Exception as e:
         elapsed = time.time() - start_time
+        error_msg = str(e)
+        # Only expose known safe error messages to the user
+        if not any(keyword in error_msg.lower() for keyword in [
+            "no audio", "no speech", "whisper", "too long", "corrupt",
+            "unsupported", "timed out", "disk", "codec", "permission",
+        ]):
+            error_msg = "Video processing failed. Please try again."
         with jobs_lock:
             jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = str(e)
+            jobs[job_id]["error"] = error_msg
             jobs[job_id]["elapsed_seconds"] = int(elapsed)
-        logger.error("Error processing video: %s", e)
+        logger.error("Error processing video for job %s: %s", job_id, e)
     finally:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -440,9 +600,10 @@ def reburn_video_task(job_id: str) -> None:
             job["output_file"] = output_filename
 
     except Exception as e:
+        logger.error("Error reburning video for job %s: %s", job_id, e)
         with jobs_lock:
             jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = str(e)
+            jobs[job_id]["error"] = "Failed to re-burn subtitles. Please try again."
     finally:
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -475,9 +636,10 @@ def download_video_task(job_id: str, url: str, quality: str) -> None:
             jobs[job_id]["download_status"] = "complete"
 
     except Exception as e:
+        logger.error("Error downloading video for job %s: %s", job_id, e)
         with jobs_lock:
             jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = str(e)
+            jobs[job_id]["error"] = "Failed to download video. Please try again."
 
 
 # ============================================
@@ -486,6 +648,7 @@ def download_video_task(job_id: str, url: str, quality: str) -> None:
 
 @app.post("/upload")
 async def upload_video(
+    request: Request,
     background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     language: str = Form(...),
@@ -493,50 +656,71 @@ async def upload_video(
     ollama_model: str = Form("llama3.2"),
 ):
     """Upload video and start processing."""
+    check_rate_limit(request, max_requests=10)
     if not video.filename or not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file.")
 
-    job_id = str(uuid.uuid4())[:8]
-    video_path = UPLOAD_DIR / f"{job_id}_{video.filename}"
+    language = validate_language(language)
+    translation_service = validate_translation_service(translation_service)
+    use_ollama = translation_service.lower() == "ollama"
+    if use_ollama:
+        ollama_model = validate_ollama_model(ollama_model)
+
+    with jobs_lock:
+        if len(jobs) >= MAX_CONCURRENT_JOBS:
+            raise HTTPException(status_code=429, detail="Server is busy. Please try again later.")
+
+    job_id = str(uuid.uuid4())
+    safe_name = sanitize_filename(video.filename)
+    video_path = UPLOAD_DIR / f"{job_id}_{safe_name}"
+    validate_path_containment(video_path, UPLOAD_DIR)
     await save_upload_chunked(video, video_path)
 
-    jobs[job_id] = {
-        "status": "queued",
-        "progress": 0,
-        "output_file": None,
-        "error": None,
-        "original_filename": video.filename,
-        "video_path": str(video_path),
-        "language": language,
-        "created_at": datetime.now(),
-    }
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "queued",
+            "progress": 0,
+            "output_file": None,
+            "error": None,
+            "original_filename": safe_name,
+            "video_path": str(video_path),
+            "language": language,
+            "created_at": datetime.now(),
+        }
 
-    use_ollama = translation_service.lower() == "ollama"
     background_tasks.add_task(process_video, job_id, str(video_path), language, use_ollama, ollama_model)
 
     return {"job_id": job_id, "message": "Video uploaded successfully. Processing started."}
 
 
 @app.post("/upload-only")
-async def upload_video_only(video: UploadFile = File(...)):
+async def upload_video_only(request: Request, video: UploadFile = File(...)):
     """Upload video without starting processing (for wizard flow)."""
+    check_rate_limit(request, max_requests=10)
     if not video.filename or not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file.")
 
-    job_id = str(uuid.uuid4())[:8]
-    video_path = UPLOAD_DIR / f"{job_id}_{video.filename}"
+    with jobs_lock:
+        if len(jobs) >= MAX_CONCURRENT_JOBS:
+            raise HTTPException(status_code=429, detail="Server is busy. Please try again later.")
+
+    job_id = str(uuid.uuid4())
+    safe_name = sanitize_filename(video.filename)
+    video_path = UPLOAD_DIR / f"{job_id}_{safe_name}"
+    validate_path_containment(video_path, UPLOAD_DIR)
     await save_upload_chunked(video, video_path)
 
-    jobs[job_id] = {
-        "status": "uploaded",
-        "progress": 0,
-        "output_file": None,
-        "error": None,
-        "original_filename": video.filename,
-        "video_path": str(video_path),
-        "source_type": "upload",
-        "created_at": datetime.now(),
-    }
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "uploaded",
+            "progress": 0,
+            "output_file": None,
+            "error": None,
+            "original_filename": safe_name,
+            "video_path": str(video_path),
+            "source_type": "upload",
+            "created_at": datetime.now(),
+        }
 
     return {"job_id": job_id, "message": "Video uploaded successfully."}
 
@@ -554,32 +738,61 @@ class ProcessRequest(BaseModel):
 @app.post("/process/{job_id}")
 async def process_existing_video(
     job_id: str,
+    http_request: Request,
     request: ProcessRequest,
     background_tasks: BackgroundTasks,
     job: dict = Depends(get_validated_job),
 ):
     """Start translation processing on an already downloaded/uploaded video."""
+    check_rate_limit(http_request, max_requests=10)
+    language = validate_language(request.language)
+    translation_service = validate_translation_service(request.translation_service)
+    use_ollama = translation_service.lower() == "ollama"
+    if use_ollama:
+        validate_ollama_model(request.ollama_model)
+
     video_path = find_video_path(job_id)
     if not video_path:
         raise HTTPException(status_code=404, detail="Video file not found. Upload or download a video first.")
 
-    job["status"] = "queued"
-    job["progress"] = 0
-    job["output_file"] = None
-    job["error"] = None
-    job["language"] = request.language
-    job["original_filename"] = job.get("original_filename", Path(video_path).name)
+    with jobs_lock:
+        job["status"] = "queued"
+        job["progress"] = 0
+        job["output_file"] = None
+        job["error"] = None
+        job["language"] = language
+        job["original_filename"] = job.get("original_filename", Path(video_path).name)
 
-    use_ollama = request.translation_service.lower() == "ollama"
-    background_tasks.add_task(process_video, job_id, video_path, request.language, use_ollama, request.ollama_model)
+    background_tasks.add_task(process_video, job_id, video_path, language, use_ollama, request.ollama_model)
 
     return {"job_id": job_id, "message": "Processing started."}
 
 
 @app.get("/status/{job_id}")
 async def get_status(job_id: str, job: dict = Depends(get_validated_job)):
-    """Get processing status."""
-    return job
+    """Get processing status. Returns only safe fields (no internal paths)."""
+    safe_fields = {
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "error": job.get("error"),
+        "language": job.get("language"),
+        "output_file": Path(job["output_file"]).name if job.get("output_file") else None,
+        "subtitles": job.get("subtitles"),
+        "edited": job.get("edited", False),
+        "srt_content": job.get("srt_content"),
+        "original_srt_content": job.get("original_srt_content"),
+        "token_usage": job.get("token_usage"),
+        "original_filename": job.get("original_filename"),
+        "elapsed_time": job.get("elapsed_time"),
+        "elapsed_seconds": job.get("elapsed_seconds"),
+        "video_info": job.get("video_info"),
+        "source_type": job.get("source_type"),
+        "download_status": job.get("download_status"),
+        "trimmed": job.get("trimmed"),
+        "trim_start": job.get("trim_start"),
+        "trim_end": job.get("trim_end"),
+    }
+    return {k: v for k, v in safe_fields.items() if v is not None}
 
 
 @app.get("/download/{job_id}")
@@ -589,12 +802,14 @@ async def download_video(job_id: str, job: dict = Depends(get_validated_job)):
         raise HTTPException(status_code=400, detail="Video is not ready yet")
 
     output_path = OUTPUT_DIR / job["output_file"]
+    validate_path_containment(output_path, OUTPUT_DIR)
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Output file not found")
 
+    safe_download_name = sanitize_filename(f"subtitled_{job['original_filename']}")
     return FileResponse(
         path=str(output_path),
-        filename=f"subtitled_{job['original_filename']}",
+        filename=safe_download_name,
         media_type="video/mp4",
     )
 
@@ -659,7 +874,8 @@ async def get_ollama_models():
         models = ollama.list()
         return {"models": [m['name'] for m in models.get('models', [])]}
     except Exception as e:
-        return {"models": [], "error": str(e)}
+        logger.error("Failed to list Ollama models: %s", e)
+        return {"models": [], "error": "Failed to connect to Ollama"}
 
 
 # ============================================
@@ -668,7 +884,7 @@ async def get_ollama_models():
 
 class DownloadRequest(BaseModel):
     url: str
-    quality: str = "720p"
+    quality: Literal["720p", "1080p", "best"] = "720p"
 
 
 @app.get("/video-info")
@@ -688,53 +904,64 @@ async def get_video_info_endpoint(url: str = Query(..., description="YouTube or 
             "video_id": info.video_id,
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("Failed to get video info: %s", e)
+        raise HTTPException(status_code=400, detail="Failed to get video info. Please check the URL.")
 
 
 @app.post("/download-url")
-async def download_from_url(background_tasks: BackgroundTasks, request: DownloadRequest):
+async def download_from_url(http_request: Request, background_tasks: BackgroundTasks, request: DownloadRequest):
     """Start downloading video from URL."""
+    check_rate_limit(http_request, max_requests=5)
     url = request.url.strip()
-    quality = request.quality
 
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
     if not is_valid_url(url):
         raise HTTPException(status_code=400, detail="Invalid URL. Please provide a YouTube or X/Twitter video link.")
-    if quality not in ["720p", "1080p", "best"]:
-        quality = "720p"
+
+    with jobs_lock:
+        if len(jobs) >= MAX_CONCURRENT_JOBS:
+            raise HTTPException(status_code=429, detail="Server is busy. Please try again later.")
 
     try:
         info = get_video_info(url)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error("Failed to get video info: %s", e)
+        raise HTTPException(status_code=400, detail="Failed to get video info. Please check the URL.")
 
-    job_id = str(uuid.uuid4())[:8]
+    # Reject videos longer than 1 hour
+    if info.duration > 3600:
+        raise HTTPException(status_code=400, detail="Video is too long. Maximum duration is 1 hour.")
 
-    jobs[job_id] = {
-        "status": "queued",
-        "progress": 0,
-        "output_file": None,
-        "error": None,
-        "source_type": info.source.value,
-        "source_url": url,
-        "video_info": {
-            "title": info.title,
-            "duration": info.duration,
-            "thumbnail": info.thumbnail,
-            "video_id": info.video_id,
-        },
-        "video_path": None,
-        "download_status": "pending",
-        "created_at": datetime.now(),
+    job_id = str(uuid.uuid4())
+
+    video_info = {
+        "title": info.title,
+        "duration": info.duration,
+        "thumbnail": info.thumbnail,
+        "video_id": info.video_id,
     }
 
-    background_tasks.add_task(download_video_task, job_id, url, quality)
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "queued",
+            "progress": 0,
+            "output_file": None,
+            "error": None,
+            "source_type": info.source.value,
+            "source_url": url,
+            "video_info": video_info,
+            "video_path": None,
+            "download_status": "pending",
+            "created_at": datetime.now(),
+        }
+
+    background_tasks.add_task(download_video_task, job_id, url, request.quality)
 
     return {
         "job_id": job_id,
         "message": "Download started",
-        "video_info": jobs[job_id]["video_info"],
+        "video_info": video_info,
     }
 
 
@@ -747,7 +974,6 @@ async def get_download_status(job_id: str, job: dict = Depends(get_validated_job
         "download_status": job.get("download_status"),
         "error": job.get("error"),
         "video_info": job.get("video_info"),
-        "video_path": job.get("video_path"),
     }
 
 
@@ -792,7 +1018,8 @@ async def get_video_duration_endpoint(job_id: str, _job: dict = Depends(get_vali
             "size_bytes": file_info.get("size_bytes"),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Failed to get video duration for job %s: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="Failed to get video information.")
 
 
 @app.post("/trim/{job_id}")
@@ -816,7 +1043,8 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest, job: dict = Dep
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Failed to validate trim times for job %s: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="Failed to validate trim parameters.")
 
     trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
 
@@ -827,21 +1055,24 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest, job: dict = Dep
             logger.warning("Trimmed file lost audio track, retrying")
             trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=True)
 
-        job["original_video"] = video_path
-        job["video_path"] = str(trimmed_path)
-        job["trim_start"] = start_time
-        job["trim_end"] = end_time
-        job["trimmed"] = True
+        with jobs_lock:
+            job["original_video"] = video_path
+            job["video_path"] = str(trimmed_path)
+            job["trim_start"] = start_time
+            job["trim_end"] = end_time
+            job["trimmed"] = True
 
         return {
             "message": "Video trimmed successfully",
-            "trimmed_path": str(trimmed_path),
             "start_time": start_time,
             "end_time": end_time,
             "duration": end_time - start_time,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Trim failed for job %s: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="Video trimming failed. Please try again.")
 
 
 @app.post("/skip-trim/{job_id}")
@@ -851,17 +1082,20 @@ async def skip_trim(job_id: str, job: dict = Depends(get_validated_job)):
     if not video_path:
         raise HTTPException(status_code=404, detail="Video file not found")
 
-    job["video_path"] = video_path
+    with jobs_lock:
+        job["video_path"] = video_path
 
     try:
         duration = get_video_duration(video_path)
-        job["trim_start"] = 0
-        job["trim_end"] = duration
-        job["trimmed"] = False
+        with jobs_lock:
+            job["trim_start"] = 0
+            job["trim_end"] = duration
+            job["trimmed"] = False
 
-        return {"message": "Trimming skipped", "video_path": video_path, "duration": duration}
+        return {"message": "Trimming skipped", "duration": duration}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Failed to get video duration for job %s: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="Failed to process video. Please try again.")
 
 
 # ============================================
@@ -913,9 +1147,10 @@ async def update_subtitles(job_id: str, request: SubtitlesUpdateRequest, job: di
             subtitles_dict[update.id]["text"] = update.text
             updated_count += 1
 
-    job["subtitles"] = [subtitles_dict[s["id"]] for s in subtitles]
-    job["edited"] = True
-    job["srt_content"] = subtitles_to_srt(job["subtitles"])
+    with jobs_lock:
+        job["subtitles"] = [subtitles_dict[s["id"]] for s in subtitles]
+        job["edited"] = True
+        job["srt_content"] = subtitles_to_srt(job["subtitles"])
 
     return {
         "message": f"Updated {updated_count} subtitle(s)",
@@ -925,8 +1160,9 @@ async def update_subtitles(job_id: str, request: SubtitlesUpdateRequest, job: di
 
 
 @app.post("/reburn/{job_id}")
-async def reburn_video(job_id: str, background_tasks: BackgroundTasks, job: dict = Depends(get_validated_job)):
+async def reburn_video(job_id: str, request: Request, background_tasks: BackgroundTasks, job: dict = Depends(get_validated_job)):
     """Re-embed edited subtitles into video."""
+    check_rate_limit(request, max_requests=10)
     if job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Job must be completed before re-burning")
 

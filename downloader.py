@@ -5,15 +5,27 @@ Handles downloading videos from YouTube and X/Twitter using yt-dlp
 
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import urlparse
 
 import yt_dlp
 
 logger = logging.getLogger(__name__)
+
+# Allowed URL schemes
+ALLOWED_SCHEMES = {"http", "https"}
+
+# Allowed hostnames for video downloads
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+TWITTER_HOSTS = {"twitter.com", "www.twitter.com", "mobile.twitter.com", "x.com", "www.x.com"}
+
+# Download limits
+MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
+MAX_VIDEO_DURATION = 3600  # 1 hour in seconds
+SOCKET_TIMEOUT = 30  # seconds
 
 
 class VideoSource(Enum):
@@ -34,30 +46,28 @@ class VideoInfo:
 
 
 def detect_source(url: str) -> VideoSource:
-    """Detect if URL is from YouTube, X/Twitter, or unknown source."""
-    url_lower = url.lower().strip()
-    
-    # YouTube patterns
-    youtube_patterns = [
-        r'(youtube\.com/watch\?v=)',
-        r'(youtu\.be/)',
-        r'(youtube\.com/shorts/)',
-        r'(youtube\.com/embed/)',
-    ]
-    for pattern in youtube_patterns:
-        if re.search(pattern, url_lower):
-            return VideoSource.YOUTUBE
-    
-    # X/Twitter patterns
-    twitter_patterns = [
-        r'(twitter\.com/.+/status/)',
-        r'(x\.com/.+/status/)',
-        r'(mobile\.twitter\.com/.+/status/)',
-    ]
-    for pattern in twitter_patterns:
-        if re.search(pattern, url_lower):
-            return VideoSource.TWITTER
-    
+    """Detect if URL is from YouTube, X/Twitter, or unknown source.
+
+    Uses urllib.parse for safe hostname extraction instead of regex.
+    Only allows http/https schemes to prevent SSRF via file://, ftp://, etc.
+    """
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return VideoSource.UNKNOWN
+
+    # Only allow http and https schemes
+    if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+        return VideoSource.UNKNOWN
+
+    hostname = (parsed.hostname or "").lower()
+
+    if hostname in YOUTUBE_HOSTS:
+        return VideoSource.YOUTUBE
+
+    if hostname in TWITTER_HOSTS:
+        return VideoSource.TWITTER
+
     return VideoSource.UNKNOWN
 
 
@@ -77,12 +87,13 @@ def get_video_info(url: str) -> VideoInfo:
     """
     source = detect_source(url)
     if source == VideoSource.UNKNOWN:
-        raise ValueError(f"Unsupported URL. Please use YouTube or X/Twitter links.")
+        raise ValueError("Unsupported URL. Please use YouTube or X/Twitter links.")
     
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
+        'socket_timeout': SOCKET_TIMEOUT,
     }
 
     if source == VideoSource.TWITTER:
@@ -96,16 +107,26 @@ def get_video_info(url: str) -> VideoInfo:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
+            duration = float(info.get('duration', 0))
+            if duration > MAX_VIDEO_DURATION:
+                raise ValueError(
+                    f"Video is too long ({duration / 60:.0f} min). "
+                    f"Maximum duration is {MAX_VIDEO_DURATION // 60} minutes."
+                )
+
             return VideoInfo(
                 title=info.get('title', 'Unknown Title'),
-                duration=float(info.get('duration', 0)),
+                duration=duration,
                 thumbnail=info.get('thumbnail'),
                 source=source,
                 url=url,
                 video_id=info.get('id', 'unknown')
             )
+    except ValueError:
+        raise
     except Exception as e:
-        raise Exception(f"Failed to get video info: {str(e)}")
+        logger.error("Failed to get video info: %s", e)
+        raise Exception("Failed to get video info. Please check the URL and try again.")
 
 
 def download_video(
@@ -134,7 +155,7 @@ def download_video(
     """
     source = detect_source(url)
     if source == VideoSource.UNKNOWN:
-        raise ValueError(f"Unsupported URL. Please use YouTube or X/Twitter links.")
+        raise ValueError("Unsupported URL. Please use YouTube or X/Twitter links.")
     
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
@@ -165,6 +186,8 @@ def download_video(
         'quiet': True,
         'no_warnings': True,
         'progress_hooks': [progress_hook],
+        'socket_timeout': SOCKET_TIMEOUT,
+        'max_filesize': MAX_DOWNLOAD_BYTES,
     }
 
     if source == VideoSource.TWITTER:
@@ -192,7 +215,8 @@ def download_video(
         raise Exception("Download completed but output file not found")
 
     except Exception as e:
-        raise Exception(f"Failed to download video: {str(e)}")
+        logger.error("Failed to download video: %s", e)
+        raise Exception("Failed to download video. Please check the URL and try again.")
 
 
 def is_valid_url(url: str) -> bool:

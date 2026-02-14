@@ -1,20 +1,25 @@
 # SubtitleAI - Video Subtitle Generator Dependencies
+# Pinned to exact versions for reproducible builds
 
 # Web Framework
-fastapi
-uvicorn[standard]
-python-multipart
+fastapi==0.128.4
+uvicorn[standard]==0.40.0
+python-multipart==0.0.22
+starlette==0.52.1
 
 # AI Services
-openai          # Whisper transcription & GPT translation
-ollama          # Local open-source translation (optional)
+openai==2.17.0        # Whisper transcription & GPT translation
+ollama==0.6.1         # Local open-source translation (optional)
 
 # Environment
-python-dotenv
+python-dotenv==1.2.1
 
 # RTL Support
-python-bidi
-arabic-reshaper
+python-bidi==0.6.7
+arabic-reshaper==3.0.0
 
 # Video Downloading
-yt-dlp>=2025.11  # Requires 3.10+; versions before this have broken YouTube support
+yt-dlp==2026.2.4
+
+# Testing
+pytest==9.0.2

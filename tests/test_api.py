@@ -5,6 +5,12 @@ from datetime import datetime
 
 from app import jobs, jobs_lock
 
+# Test UUIDs for consistent use across tests
+PROC_UUID = "11111111-1111-1111-1111-111111111111"
+NOTR_UUID = "22222222-2222-2222-2222-222222222222"
+WORK_UUID = "33333333-3333-3333-3333-333333333333"
+NOSUB_UUID = "44444444-4444-4444-4444-444444444444"
+
 
 # ============================================
 # Job validation (get_validated_job dependency)
@@ -12,7 +18,7 @@ from app import jobs, jobs_lock
 
 class TestJobValidation:
     def test_nonexistent_job_returns_404(self, client):
-        response = client.get("/status/nonexistent")
+        response = client.get("/status/550e8400-e29b-41d4-a716-446655440099")
         assert response.status_code == 404
         assert "Job not found" in response.json()["detail"]
 
@@ -77,26 +83,26 @@ class TestUploadValidation:
 class TestDownloadValidation:
     def test_download_video_not_completed(self, client):
         # Create a job that's still processing
-        jobs["proc1234"] = {
+        jobs[PROC_UUID] = {
             "status": "transcribing",
             "progress": 30,
             "output_file": None,
             "error": None,
             "original_filename": "test.mp4",
         }
-        response = client.get("/download/proc1234")
+        response = client.get(f"/download/{PROC_UUID}")
         assert response.status_code == 400
         assert "not ready" in response.json()["detail"].lower()
 
     def test_download_srt_not_completed(self, client):
-        jobs["proc1234"] = {
+        jobs[PROC_UUID] = {
             "status": "embedding_subtitles",
             "progress": 70,
             "output_file": None,
             "error": None,
             "original_filename": "test.mp4",
         }
-        response = client.get("/download-srt/proc1234")
+        response = client.get(f"/download-srt/{PROC_UUID}")
         assert response.status_code == 400
 
     def test_download_srt_completed(self, client, sample_job):
@@ -114,7 +120,7 @@ class TestDownloadValidation:
         assert "Hello world" in response.text
 
     def test_download_transcription_no_content(self, client):
-        jobs["notr1234"] = {
+        jobs[NOTR_UUID] = {
             "status": "completed",
             "progress": 100,
             "output_file": "test.mp4",
@@ -122,7 +128,7 @@ class TestDownloadValidation:
             "original_filename": "test.mp4",
             "original_srt_content": "",
         }
-        response = client.get("/download-transcription/notr1234")
+        response = client.get(f"/download-transcription/{NOTR_UUID}")
         assert response.status_code == 404
         assert "not available" in response.json()["detail"].lower()
 
@@ -133,11 +139,11 @@ class TestDownloadValidation:
 
 class TestSubtitleValidation:
     def test_get_subtitles_not_completed(self, client):
-        jobs["work1234"] = {
+        jobs[WORK_UUID] = {
             "status": "translating",
             "progress": 50,
         }
-        response = client.get("/subtitles/work1234")
+        response = client.get(f"/subtitles/{WORK_UUID}")
         assert response.status_code == 400
         assert "not completed" in response.json()["detail"].lower()
 
@@ -150,12 +156,12 @@ class TestSubtitleValidation:
         assert data["language"] == "Hebrew"
 
     def test_update_subtitles_not_completed(self, client):
-        jobs["work1234"] = {
+        jobs[WORK_UUID] = {
             "status": "translating",
             "progress": 50,
         }
         response = client.put(
-            "/subtitles/work1234",
+            f"/subtitles/{WORK_UUID}",
             json={"subtitles": [{"id": 1, "text": "test"}]},
         )
         assert response.status_code == 400
@@ -180,20 +186,20 @@ class TestSubtitleValidation:
 
 class TestReburnValidation:
     def test_reburn_not_completed(self, client):
-        jobs["work1234"] = {
+        jobs[WORK_UUID] = {
             "status": "translating",
             "progress": 50,
         }
-        response = client.post("/reburn/work1234")
+        response = client.post(f"/reburn/{WORK_UUID}")
         assert response.status_code == 400
 
     def test_reburn_no_subtitles(self, client):
-        jobs["nosub123"] = {
+        jobs[NOSUB_UUID] = {
             "status": "completed",
             "progress": 100,
             "subtitles": [],
         }
-        response = client.post("/reburn/nosub123")
+        response = client.post(f"/reburn/{NOSUB_UUID}")
         assert response.status_code == 400
         assert "No subtitles" in response.json()["detail"]
 
@@ -234,15 +240,15 @@ class TestUrlValidation:
 class TestTrimValidation:
     def test_trim_nonexistent_job(self, client):
         response = client.post(
-            "/trim/nonexist1",
+            "/trim/550e8400-e29b-41d4-a716-446655449999",
             json={"start_time": 0, "end_time": 10},
         )
         assert response.status_code == 404
 
     def test_skip_trim_nonexistent_job(self, client):
-        response = client.post("/skip-trim/nonexist1")
+        response = client.post("/skip-trim/550e8400-e29b-41d4-a716-446655449999")
         assert response.status_code == 404
 
     def test_video_duration_nonexistent_job(self, client):
-        response = client.get("/video-duration/nonexist1")
+        response = client.get("/video-duration/550e8400-e29b-41d4-a716-446655449999")
         assert response.status_code == 404

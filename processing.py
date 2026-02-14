@@ -7,14 +7,10 @@ import logging
 import os
 import re
 import platform
-import shutil
 import subprocess
-import tempfile
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional
-
 import openai
 import ollama
 
@@ -27,6 +23,30 @@ FFMPEG_PROBE_TIMEOUT = 10      # 10 sec for ffprobe
 
 # Whisper API file size limit
 WHISPER_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
+
+
+def escape_ffmpeg_filter_text(text: str) -> str:
+    """Escape special characters for FFmpeg filter expressions.
+
+    FFmpeg drawtext and subtitle filters treat certain characters as special.
+    This function escapes them to prevent filter injection.
+    """
+    # Order matters: escape backslash first
+    for char in ("\\", "'", ":", "[", "]", ";"):
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+def sanitize_subtitle_text(text: str) -> str:
+    """Strip ASS override tags and control characters from subtitle text.
+
+    Prevents FFmpeg filter injection via user-edited subtitles.
+    """
+    # Remove ASS override tags like {\b1}, {\i1}, {\fs20}, etc.
+    text = re.sub(r'\{\\[^}]*\}', '', text)
+    # Remove control characters (keep newlines and tabs)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    return text
 
 
 def has_audio_stream(video_path: str) -> bool:
@@ -63,7 +83,9 @@ def parse_ffmpeg_error(stderr: str) -> str:
         return "Video file not found."
     if "does not contain any stream" in stderr_lower:
         return "Video file has no valid streams."
-    return f"Video processing failed: {stderr[:200] if stderr else 'Unknown error'}"
+    if stderr:
+        logger.error("Unrecognized FFmpeg error: %s", stderr[:500])
+    return "Video processing failed. Please try a different video or format."
 
 
 def format_timestamp(seconds: float) -> str:
@@ -520,14 +542,18 @@ def process_srt_for_rtl(srt_content: str) -> str:
 
 
 def subtitles_to_srt(subtitles: list[dict]) -> str:
-    """Convert subtitles list back to SRT format."""
+    """Convert subtitles list back to SRT format.
+
+    Sanitizes subtitle text to prevent FFmpeg filter injection.
+    """
     srt_content: list[str] = []
     for sub in subtitles:
         start_time = format_timestamp(sub['start'])
         end_time = format_timestamp(sub['end'])
+        text = sanitize_subtitle_text(sub['text'])
         srt_content.append(f"{sub['id']}")
         srt_content.append(f"{start_time} --> {end_time}")
-        srt_content.append(sub['text'])
+        srt_content.append(text)
         srt_content.append("")
     return "\n".join(srt_content)
 
@@ -593,21 +619,20 @@ def embed_subtitles(
         "Outline=1,Shadow=2,Bold=0,MarginV=30"
     )
 
-    srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "'\\''")
+    srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "'\\''").replace("[", "\\[").replace("]", "\\]").replace(";", "\\;")
 
     wm = watermark_config
     logo_path = wm["logo_path"]
 
     if logo_path.exists():
-        logo_escaped = str(logo_path.absolute()).replace("\\", "/").replace(":", "\\:")
         opacity = wm["opacity"]
         logo_h = wm["logo_height"]
         margin = wm["margin"]
         eng_size = wm["english_font_size"]
         heb_size = wm["hebrew_font_size"]
         spacing = wm["text_spacing"]
-        eng_text = wm["english_text"]
-        heb_text = wm["hebrew_text"][::-1]  # Reverse for FFmpeg RTL fix
+        eng_text = escape_ffmpeg_filter_text(wm["english_text"])
+        heb_text = escape_ffmpeg_filter_text(wm["hebrew_text"][::-1])  # Reverse for FFmpeg RTL fix
 
         hebrew_font_escaped = hebrew_font.replace("\\", "/").replace(":", "\\\\:")
 

@@ -57,14 +57,17 @@ class TestFormatTimestamp:
 # ============================================
 
 class TestValidateJobId:
-    def test_valid_uuid_short(self):
-        assert validate_job_id("abc12345") is True
+    def test_valid_full_uuid(self):
+        assert validate_job_id("550e8400-e29b-41d4-a716-446655440000") is True
 
-    def test_valid_with_hyphens(self):
-        assert validate_job_id("a1b2c3d4-e5f6") is True
+    def test_valid_uuid_lowercase(self):
+        assert validate_job_id("a1b2c3d4-e5f6-7890-abcd-ef1234567890") is True
 
-    def test_full_uuid(self):
-        assert validate_job_id("550e8400-e29b-41d4-a716-44665544") is True
+    def test_short_id_rejected(self):
+        assert validate_job_id("abc12345") is False
+
+    def test_partial_uuid_rejected(self):
+        assert validate_job_id("a1b2c3d4-e5f6") is False
 
     def test_empty_string(self):
         assert validate_job_id("") is False
@@ -77,23 +80,20 @@ class TestValidateJobId:
         assert validate_job_id("abc;rm -rf /") is False
         assert validate_job_id("test<script>") is False
 
-    def test_too_long(self):
-        assert validate_job_id("a" * 37) is False
-
-    def test_max_length(self):
-        assert validate_job_id("a" * 36) is True
-
-    def test_single_char(self):
-        assert validate_job_id("a") is True
-
-    def test_only_numbers(self):
-        assert validate_job_id("12345678") is True
+    def test_uppercase_rejected(self):
+        assert validate_job_id("550E8400-E29B-41D4-A716-446655440000") is False
 
     def test_underscores_rejected(self):
-        assert validate_job_id("test_id") is False
+        assert validate_job_id("test_id_1-2345-6789-abcd-ef1234567890") is False
 
     def test_spaces_rejected(self):
         assert validate_job_id("test id") is False
+
+    def test_wrong_format(self):
+        assert validate_job_id("a" * 36) is False
+
+    def test_single_char(self):
+        assert validate_job_id("a") is False
 
 
 # ============================================
@@ -135,16 +135,18 @@ class TestParseFfmpegError:
 
     def test_empty_stderr(self):
         result = parse_ffmpeg_error("")
-        assert "Unknown error" in result
+        assert "Video processing failed" in result
 
     def test_none_stderr(self):
         result = parse_ffmpeg_error(None)
-        assert "Unknown error" in result
+        assert "Video processing failed" in result
 
-    def test_long_stderr_truncated(self):
+    def test_long_stderr_no_leak(self):
         long_msg = "x" * 500
         result = parse_ffmpeg_error(long_msg)
-        assert len(result) < 300  # Should be truncated
+        # Should return generic message, not leak raw stderr
+        assert "Video processing failed" in result
+        assert "x" * 50 not in result
 
 
 # ============================================

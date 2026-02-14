@@ -3,7 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app import app, jobs, jobs_lock
+from app import app, jobs, jobs_lock, rate_limiter
 
 
 @pytest.fixture
@@ -14,9 +14,11 @@ def client():
 
 @pytest.fixture(autouse=True)
 def clear_jobs():
-    """Clear the jobs dict before each test."""
+    """Clear the jobs dict and rate limiter before each test."""
     with jobs_lock:
         jobs.clear()
+    with rate_limiter._lock:
+        rate_limiter._requests.clear()
     yield
     with jobs_lock:
         jobs.clear()
@@ -25,11 +27,11 @@ def clear_jobs():
 @pytest.fixture
 def sample_job():
     """Insert a completed sample job into the jobs dict and return (job_id, job)."""
-    job_id = "test1234"
+    job_id = "550e8400-e29b-41d4-a716-446655440000"
     job = {
         "status": "completed",
         "progress": 100,
-        "output_file": "test1234_subtitled.mp4",
+        "output_file": "550e8400-e29b-41d4-a716-446655440000_subtitled.mp4",
         "error": None,
         "original_filename": "demo.mp4",
         "video_path": "/tmp/fake_video.mp4",

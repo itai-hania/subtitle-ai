@@ -4,11 +4,13 @@ Handles video trimming using FFmpeg
 """
 
 import logging
+import os
 import subprocess
 from pathlib import Path
-from typing import Optional
-
 logger = logging.getLogger(__name__)
+
+# Allowed directories for output files
+ALLOWED_OUTPUT_DIRS = {Path("uploads"), Path("outputs"), Path("downloads")}
 
 # Timeout for trimming operations (seconds)
 TRIM_TIMEOUT = 600  # 10 minutes
@@ -46,7 +48,8 @@ def get_video_duration(video_path: str) -> float:
     except subprocess.TimeoutExpired:
         raise Exception("Timed out getting video duration")
     except subprocess.CalledProcessError as e:
-        raise Exception(f"Failed to get video duration: {e.stderr}")
+        logger.error("FFprobe failed for %s: %s", video_path, e.stderr)
+        raise Exception("Failed to get video duration.")
     except ValueError:
         raise Exception("Failed to parse video duration")
 
@@ -86,22 +89,33 @@ def trim_video(
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
-    
+
     if not input_path.exists():
         raise FileNotFoundError(f"Input video not found: {input_path}")
-    
+
+    # Validate output path containment
+    resolved_output = output_path.resolve()
+    allowed = False
+    for allowed_dir in ALLOWED_OUTPUT_DIRS:
+        allowed_resolved = allowed_dir.resolve()
+        if str(resolved_output).startswith(str(allowed_resolved) + os.sep):
+            allowed = True
+            break
+    if not allowed:
+        raise ValueError("Invalid output path")
+
     # Validate time range
     if start_time < 0:
         start_time = 0
-    
+
     if end_time <= start_time:
         raise ValueError("End time must be greater than start time")
-    
+
     # Get duration to validate end_time
     duration = get_video_duration(str(input_path))
     if end_time > duration:
         end_time = duration
-    
+
     # Ensure output directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -141,7 +155,8 @@ def trim_video(
         raise Exception("Video trimming timed out. The video may be too long or complex.")
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.decode() if e.stderr else "Unknown error"
-        raise Exception(f"Failed to trim video: {error_msg}")
+        logger.error("FFmpeg trim failed: %s", error_msg[:500])
+        raise Exception("Failed to trim video. Please try again.")
 
 
 def get_video_info(video_path: str) -> dict:
@@ -193,6 +208,8 @@ def get_video_info(video_path: str) -> dict:
             "fps": round(fps, 2)
         }
     except subprocess.CalledProcessError as e:
-        raise Exception(f"Failed to get video info: {e.stderr}")
+        logger.error("FFprobe info failed: %s", e.stderr)
+        raise Exception("Failed to get video info.")
     except Exception as e:
-        raise Exception(f"Failed to parse video info: {str(e)}")
+        logger.error("Failed to parse video info: %s", e)
+        raise Exception("Failed to get video info.")
