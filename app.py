@@ -368,6 +368,32 @@ def process_video(
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def find_source_video_path(job_id: str) -> Optional[str]:
+    """Find the original source video (upload/download/trimmed), NOT the subtitled output."""
+    job = jobs.get(job_id)
+    if not job:
+        return None
+
+    # Prefer trimmed video if available
+    trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
+    if trimmed_path.exists():
+        return str(trimmed_path)
+
+    # Use the original video_path stored at upload/download time
+    video_path = job.get("video_path")
+    if video_path and Path(video_path).exists():
+        return video_path
+
+    # Fallback: search uploads and downloads directories
+    for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR]:
+        for ext in ['mp4', 'mov', 'avi', 'mkv']:
+            for file in search_dir.iterdir():
+                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
+                    return str(file)
+
+    return None
+
+
 def reburn_video_task(job_id: str) -> None:
     """Background task to re-burn subtitles into video."""
     temp_dir = None
@@ -377,12 +403,8 @@ def reburn_video_task(job_id: str) -> None:
             job["status"] = "reburning"
             job["progress"] = Progress.REBURN_START
 
-        # Use trimmed video if available, otherwise find the original
-        trimmed_path = UPLOAD_DIR / f"{job_id}_trimmed.mp4"
-        if trimmed_path.exists():
-            video_path = str(trimmed_path)
-        else:
-            video_path = find_video_path(job_id)
+        # IMPORTANT: Use the original source video, NOT the subtitled output
+        video_path = find_source_video_path(job_id)
 
         if not video_path or not Path(video_path).exists():
             raise Exception("Video file not found")

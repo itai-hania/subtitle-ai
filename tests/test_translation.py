@@ -2,7 +2,7 @@
 
 import pytest
 
-from processing import parse_numbered_translations
+from processing import parse_numbered_translations, is_untranslated
 
 
 class TestParseNumberedTranslations:
@@ -132,3 +132,38 @@ class TestParseNumberedTranslations:
         originals = ["Hello, world!"]
         translations = parse_numbered_translations(result_text, originals)
         assert translations[0] == "!שלום, עולם"
+
+
+class TestIsUntranslated:
+    """Tests for is_untranslated — detects English text when target is non-Latin."""
+
+    def test_hebrew_text_not_flagged(self):
+        assert is_untranslated("שלום עולם", "hebrew") is False
+
+    def test_english_text_flagged_for_hebrew(self):
+        assert is_untranslated("Hello world this is English", "hebrew") is True
+
+    def test_english_text_not_flagged_for_spanish(self):
+        """Latin-script target languages should never be flagged."""
+        assert is_untranslated("Hello world", "spanish") is False
+
+    def test_mixed_mostly_hebrew(self):
+        """Mostly Hebrew with a few English words (like proper nouns) is OK."""
+        assert is_untranslated("וורן באפט הוא משקיע מוצלח", "hebrew") is False
+
+    def test_mixed_mostly_english(self):
+        """Mostly English with a Hebrew word is still untranslated."""
+        assert is_untranslated("The שלום investor bought stocks", "hebrew") is True
+
+    def test_numbers_only(self):
+        """Pure numbers have no alpha chars — should not be flagged."""
+        assert is_untranslated("1956, 69, 69", "hebrew") is False
+
+    def test_empty_string(self):
+        assert is_untranslated("", "hebrew") is False
+
+    def test_arabic_target(self):
+        assert is_untranslated("Hello world", "arabic") is True
+
+    def test_russian_target(self):
+        assert is_untranslated("Hello world", "russian") is True

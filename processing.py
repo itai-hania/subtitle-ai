@@ -293,6 +293,85 @@ Example format:
     return parse_numbered_translations(result_text, texts)
 
 
+def is_untranslated(text: str, target_language: str) -> bool:
+    """Check if text appears to still be in English when target is a non-Latin language."""
+    if target_language.lower() not in ("hebrew", "arabic", "russian", "chinese", "japanese", "korean"):
+        return False
+
+    # Count Latin alphabet characters vs total alpha characters
+    latin_chars = sum(1 for c in text if c.isalpha() and ord(c) < 128)
+    total_alpha = sum(1 for c in text if c.isalpha())
+
+    if total_alpha == 0:
+        return False
+
+    # If more than 60% of alphabetic chars are Latin, likely untranslated
+    return (latin_chars / total_alpha) > 0.6
+
+
+def retry_untranslated_segments(
+    client: openai.OpenAI,
+    indices: list[int],
+    original_texts: list[str],
+    translated_texts: list[str],
+    target_language: str,
+) -> tuple[list[str], dict]:
+    """Re-translate segments that were left in English. Returns updated texts and token usage."""
+    if not indices:
+        return translated_texts, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    texts_to_retry = [original_texts[i] for i in indices]
+    logger.warning(
+        "Retrying %d untranslated segments: indices %s",
+        len(indices), indices
+    )
+
+    numbered_text = "\n".join([f"[{i+1}] {text}" for i, text in enumerate(texts_to_retry)])
+
+    response = client.chat.completions.create(
+        model="gpt-5-mini",
+        reasoning_effort="low",
+        max_completion_tokens=10000,
+        messages=[
+            {
+                "role": "system",
+                "content": f"""You are a Hebrew translator. Translate each numbered line to {target_language}.
+
+ABSOLUTE RULES - VIOLATION IS UNACCEPTABLE:
+1. Keep the EXACT numbering format: [1], [2], etc.
+2. You MUST translate EVERY single word to {target_language}. Zero English words allowed.
+3. If a word has no direct translation, transliterate it to Hebrew characters.
+4. Output ONLY the numbered translations, nothing else."""
+            },
+            {
+                "role": "user",
+                "content": numbered_text
+            }
+        ]
+    )
+
+    token_usage = {
+        "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+        "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+        "total_tokens": response.usage.total_tokens if response.usage else 0,
+    }
+
+    result_text = response.choices[0].message.content
+    retried = parse_numbered_translations(result_text, texts_to_retry)
+
+    # Replace the untranslated segments with retried translations
+    result = list(translated_texts)
+    for idx, retried_text in zip(indices, retried):
+        if not is_untranslated(retried_text, target_language):
+            result[idx] = retried_text
+            logger.info("  Retry succeeded for segment %d", idx + 1)
+        else:
+            logger.warning("  Retry still untranslated for segment %d, keeping retry result anyway", idx + 1)
+            result[idx] = retried_text
+
+    return result, token_usage
+
+
 # ============================================
 # SRT Generation
 # ============================================
@@ -367,6 +446,24 @@ def generate_srt(
                 translated_texts.extend(chunk_translations)
 
         logger.info("Batch translation complete!")
+
+        # Detect and retry untranslated segments (e.g. English left in Hebrew output)
+        if not use_ollama:
+            untranslated_indices = [
+                i for i, text in enumerate(translated_texts)
+                if is_untranslated(text, target_language)
+            ]
+            if untranslated_indices:
+                logger.warning(
+                    "Found %d untranslated segments, retrying...",
+                    len(untranslated_indices)
+                )
+                translated_texts, retry_tokens = retry_untranslated_segments(
+                    client, untranslated_indices, texts, translated_texts, target_language
+                )
+                total_tokens["prompt_tokens"] += retry_tokens["prompt_tokens"]
+                total_tokens["completion_tokens"] += retry_tokens["completion_tokens"]
+                total_tokens["total_tokens"] += retry_tokens["total_tokens"]
     else:
         translated_texts = texts
 
