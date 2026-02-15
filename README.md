@@ -97,8 +97,8 @@ Upload a video, get back a subtitled version with accurate translations — all 
 
 ### Translation Settings
 
-The app uses `gpt-5-nano` with optimized settings:
-- **Chunk size**: 50 segments per batch
+The app uses `gpt-5-mini` with optimized settings:
+- **Chunk size**: Dynamic (10-100 segments per batch, based on segment length)
 - **Reasoning effort**: Low (minimizes hidden tokens)
 - **Max tokens**: 10,000 per request
 
@@ -127,7 +127,7 @@ subtitle-ai/
 
 - **Backend**: FastAPI (Python)
 - **Transcription**: OpenAI Whisper API
-- **Translation**: OpenAI GPT-5-nano
+- **Translation**: OpenAI GPT-5-mini
 - **Video Processing**: FFmpeg
 - **Frontend**: Vanilla HTML/CSS/JavaScript
 

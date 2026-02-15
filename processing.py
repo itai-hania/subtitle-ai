@@ -189,11 +189,11 @@ def batch_translate_openai(
     texts: list[str],
     target_language: str,
     chunk_num: int = 0,
-) -> tuple[list[str], dict]:
+) -> tuple[list[str], dict, str]:
     """Translate a batch of texts using OpenAI GPT in a single API call.
-    Returns (translations, token_usage) tuple."""
+    Returns (translations, token_usage, log_entry) tuple."""
     if target_language.lower() == "english" or not texts:
-        return texts, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return texts, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, ""
 
     numbered_text = "\n".join([f"[{i+1}] {text}" for i, text in enumerate(texts)])
 
@@ -241,37 +241,30 @@ Example format:
 
     result_text = response.choices[0].message.content
 
-    # Log input and output for analysis
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"translation_log_{timestamp}_chunk{chunk_num}.txt"
-    with open(log_file, "w", encoding="utf-8") as f:
-        f.write(f"=== CHUNK {chunk_num} ===\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Target language: {target_language}\n")
-        f.write(f"Number of segments: {len(texts)}\n")
-        f.write(f"Input tokens: {token_usage['prompt_tokens']}\n")
-        f.write(f"Output tokens: {token_usage['completion_tokens']}\n")
-        f.write(f"\n{'='*50}\nINPUT TEXT:\n{'='*50}\n")
-        f.write(numbered_text)
-        f.write(f"\n\n{'='*50}\nOUTPUT TEXT:\n{'='*50}\n")
-        f.write(result_text)
-        f.write(f"\n\n{'='*50}\n")
-
-    logger.info("    Logged to: %s", log_file)
-
     translations = parse_numbered_translations(result_text, texts)
 
-    # Log segment mapping
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write("\nSEGMENT MAPPING:\n" + "=" * 50 + "\n")
-        for i, (orig, trans) in enumerate(zip(texts, translations), 1):
-            f.write(f"[{i}] ORIG: {orig[:50]}...\n")
-            f.write(f"[{i}] TRANS: {trans[:50]}...\n")
-            f.write("-" * 30 + "\n")
+    # Build log entry string (written to disk by caller)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_lines: list[str] = [
+        f"=== CHUNK {chunk_num} ===",
+        f"Timestamp: {timestamp}",
+        f"Target language: {target_language}",
+        f"Number of segments: {len(texts)}",
+        f"Input tokens: {token_usage['prompt_tokens']}",
+        f"Output tokens: {token_usage['completion_tokens']}",
+        f"\n{'='*50}\nINPUT TEXT:\n{'='*50}",
+        numbered_text,
+        f"\n{'='*50}\nOUTPUT TEXT:\n{'='*50}",
+        result_text,
+        f"\n{'='*50}",
+        f"\nSEGMENT MAPPING:\n{'='*50}",
+    ]
+    for i, (orig, trans) in enumerate(zip(texts, translations), 1):
+        log_lines.append(f"[{i}] ORIG: {orig[:50]}...")
+        log_lines.append(f"[{i}] TRANS: {trans[:50]}...")
+        log_lines.append("-" * 30)
 
-    return translations, token_usage
+    return translations, token_usage, "\n".join(log_lines)
 
 
 def batch_translate_ollama(
@@ -443,11 +436,19 @@ def generate_srt(
     # Batch translate if needed
     if target_language.lower() != "english":
         logger.info("Batch translating %d segments to %s...", len(texts), target_language)
-        CHUNK_SIZE = 50
-        translated_texts: list[str] = []
 
-        for chunk_start in range(0, len(texts), CHUNK_SIZE):
-            chunk_end = min(chunk_start + CHUNK_SIZE, len(texts))
+        # Dynamic batch sizing based on segment length
+        total_words = sum(len(t.split()) for t in texts)
+        avg_words = total_words / len(texts) if texts else 10
+        estimated_tokens_per_segment = avg_words * 1.5
+        chunk_size = max(10, min(100, int(4000 / max(estimated_tokens_per_segment, 1))))
+        logger.info("  Dynamic chunk size: %d (avg %.1f words/segment)", chunk_size, avg_words)
+
+        translated_texts: list[str] = []
+        log_entries: list[str] = []
+
+        for chunk_start in range(0, len(texts), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(texts))
             chunk = texts[chunk_start:chunk_end]
             logger.info(
                 "  Translating chunk %d-%d of %d...",
@@ -458,14 +459,26 @@ def generate_srt(
                 chunk_translations = batch_translate_ollama(chunk, target_language, ollama_model)
                 translated_texts.extend(chunk_translations)
             else:
-                chunk_num = chunk_start // CHUNK_SIZE + 1
-                chunk_translations, chunk_tokens = batch_translate_openai(
+                chunk_num = chunk_start // chunk_size + 1
+                chunk_translations, chunk_tokens, log_entry = batch_translate_openai(
                     client, chunk, target_language, chunk_num
                 )
                 total_tokens["prompt_tokens"] += chunk_tokens["prompt_tokens"]
                 total_tokens["completion_tokens"] += chunk_tokens["completion_tokens"]
                 total_tokens["total_tokens"] += chunk_tokens["total_tokens"]
                 translated_texts.extend(chunk_translations)
+                if log_entry:
+                    log_entries.append(log_entry)
+
+        # Write all translation logs to a single file
+        if log_entries:
+            log_dir = Path("logs")
+            log_dir.mkdir(exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            log_file = log_dir / f"translation_log_{timestamp}_job.txt"
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write("\n\n".join(log_entries))
+            logger.info("Translation log written to: %s", log_file)
 
         logger.info("Batch translation complete!")
 
@@ -661,7 +674,9 @@ def embed_subtitles(
             "-map", "[out]",
             "-map", "0:a",
             "-c:v", "libx264",
-            "-preset", "fast",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-threads", "0",
             "-c:a", "copy",
             "-movflags", "+faststart",
             output_path
@@ -676,7 +691,9 @@ def embed_subtitles(
                 f":force_style='{style}'"
             ),
             "-c:v", "libx264",
-            "-preset", "fast",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-threads", "0",
             "-vsync", "passthrough",
             "-c:a", "copy",
             "-movflags", "+faststart",

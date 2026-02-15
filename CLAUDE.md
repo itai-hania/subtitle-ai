@@ -45,7 +45,7 @@ Run tests with `pytest tests/ -v`.
 
 ```
 Video Input → Extract Audio (FFmpeg, 16kHz mono MP3)
-  → Whisper API transcription → GPT-5-mini translation (batched, 50 segments/chunk)
+  → Whisper API transcription → GPT-5-mini translation (dynamic batching, 10-100 segments/chunk)
   → Generate SRT → FFmpeg embed subtitles + watermark → Output MP4
 ```
 
@@ -69,7 +69,11 @@ All stored by job ID (UUID). Jobs auto-expire after 24 hours.
 - **FFmpeg patterns**: Use `-ss` before `-i` for fast seeking. Subtitle embedding uses `filter_complex` chaining: subtitles → drawtext → drawtext → overlay.
 - **Font resolution**: Cross-platform Hebrew font lookup in `get_hebrew_font_path()` (in `processing.py`) — checks macOS, Linux, and Windows paths.
 - **Upload limit**: 500MB max, streamed in 1MB chunks (no full-file memory load).
+- **FFmpeg encoding**: Uses `-preset veryfast -crf 23 -threads 0` for subtitle embedding (re-encoding required by subtitle filters).
 - **FFmpeg timeouts**: All subprocess calls have timeouts (10-30 min) to prevent zombie jobs.
+- **Translation batch sizing**: Dynamic chunk size (10-100) based on average words per segment, targeting ~4000 output tokens per batch.
+- **Translation logging**: Single log file per job (`logs/translation_log_{timestamp}_job.txt`), not per chunk.
+- **File tracking**: Jobs track created file paths in `"files"` list for O(1) cleanup instead of directory scanning.
 
 ## Development Rules
 

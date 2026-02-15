@@ -304,18 +304,28 @@ def cleanup_old_jobs() -> None:
     """Remove jobs older than JOB_TTL and their associated files."""
     now = datetime.now()
     with jobs_lock:
-        expired = [
-            jid for jid, job in jobs.items()
+        expired = {
+            jid: job.get("files", [])
+            for jid, job in jobs.items()
             if now - job.get("created_at", now) > JOB_TTL
-        ]
-    for jid in expired:
-        for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR, OUTPUT_DIR]:
-            for file in search_dir.iterdir():
-                if file.name.startswith(jid):
-                    try:
-                        file.unlink()
-                    except OSError:
-                        pass
+        }
+    for jid, tracked_files in expired.items():
+        if tracked_files:
+            # Fast path: delete tracked files directly
+            for file_path in tracked_files:
+                try:
+                    Path(file_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
+            # Fallback for jobs without tracked files
+            for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR, OUTPUT_DIR]:
+                for file in search_dir.iterdir():
+                    if file.name.startswith(jid):
+                        try:
+                            file.unlink()
+                        except OSError:
+                            pass
         with jobs_lock:
             jobs.pop(jid, None)
     if expired:
@@ -501,6 +511,7 @@ def process_video(
                 "subtitles": subtitles_data,
                 "edited": False,
             })
+            jobs[job_id].setdefault("files", []).append(str(output_path))
 
         logger.info("Job %s completed in %s", job_id, elapsed_formatted)
         logger.info(
@@ -598,6 +609,7 @@ def reburn_video_task(job_id: str) -> None:
             job["status"] = "completed"
             job["progress"] = Progress.COMPLETED
             job["output_file"] = output_filename
+            job.setdefault("files", []).append(str(output_path))
 
     except Exception as e:
         logger.error("Error reburning video for job %s: %s", job_id, e)
@@ -629,11 +641,24 @@ def download_video_task(job_id: str, url: str, quality: str) -> None:
             progress_callback=progress_callback,
         )
 
+        # Probe once after download and cache results
+        try:
+            cached_duration = get_video_duration(str(output_path))
+            cached_info = get_video_file_info(str(output_path))
+        except Exception:
+            cached_duration = None
+            cached_info = None
+
         with jobs_lock:
             jobs[job_id]["status"] = "downloaded"
             jobs[job_id]["progress"] = Progress.COMPLETED
             jobs[job_id]["video_path"] = str(output_path)
             jobs[job_id]["download_status"] = "complete"
+            jobs[job_id].setdefault("files", []).append(str(output_path))
+            if cached_duration is not None:
+                jobs[job_id]["cached_duration"] = cached_duration
+            if cached_info is not None:
+                jobs[job_id]["cached_video_info"] = cached_info
 
     except Exception as e:
         logger.error("Error downloading video for job %s: %s", job_id, e)
@@ -686,6 +711,7 @@ async def upload_video(
             "video_path": str(video_path),
             "language": language,
             "created_at": datetime.now(),
+            "files": [str(video_path)],
         }
 
     background_tasks.add_task(process_video, job_id, str(video_path), language, use_ollama, ollama_model)
@@ -720,6 +746,7 @@ async def upload_video_only(request: Request, video: UploadFile = File(...)):
             "video_path": str(video_path),
             "source_type": "upload",
             "created_at": datetime.now(),
+            "files": [str(video_path)],
         }
 
     return {"job_id": job_id, "message": "Video uploaded successfully."}
@@ -954,6 +981,7 @@ async def download_from_url(http_request: Request, background_tasks: BackgroundT
             "video_path": None,
             "download_status": "pending",
             "created_at": datetime.now(),
+            "files": [],
         }
 
     background_tasks.add_task(download_video_task, job_id, url, request.quality)
@@ -1010,6 +1038,12 @@ async def get_video_duration_endpoint(job_id: str, _job: dict = Depends(get_vali
     try:
         duration = get_video_duration(video_path)
         file_info = get_video_file_info(video_path)
+
+        # Cache for reuse in /trim and /skip-trim
+        with jobs_lock:
+            _job["cached_duration"] = duration
+            _job["cached_video_info"] = file_info
+
         return {
             "duration": duration,
             "width": file_info.get("width"),
@@ -1033,7 +1067,7 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest, job: dict = Dep
     end_time = request.end_time
 
     try:
-        duration = get_video_duration(video_path)
+        duration = job.get("cached_duration") or get_video_duration(video_path)
         if start_time < 0:
             start_time = 0
         if end_time > duration:
@@ -1052,8 +1086,8 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest, job: dict = Dep
         trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=True)
 
         if not has_audio_stream(str(trimmed_path)):
-            logger.warning("Trimmed file lost audio track, retrying")
-            trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=True)
+            logger.warning("Trimmed file lost audio track, retrying with stream copy")
+            trim_video(video_path, str(trimmed_path), start_time, end_time, reencode=False)
 
         with jobs_lock:
             job["original_video"] = video_path
@@ -1061,6 +1095,7 @@ async def trim_video_endpoint(job_id: str, request: TrimRequest, job: dict = Dep
             job["trim_start"] = start_time
             job["trim_end"] = end_time
             job["trimmed"] = True
+            job.setdefault("files", []).append(str(trimmed_path))
 
         return {
             "message": "Video trimmed successfully",
@@ -1086,7 +1121,7 @@ async def skip_trim(job_id: str, job: dict = Depends(get_validated_job)):
         job["video_path"] = video_path
 
     try:
-        duration = get_video_duration(video_path)
+        duration = job.get("cached_duration") or get_video_duration(video_path)
         with jobs_lock:
             job["trim_start"] = 0
             job["trim_end"] = duration
