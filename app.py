@@ -11,9 +11,10 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+import ipaddress
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -84,13 +85,52 @@ ALLOWED_OLLAMA_MODELS = {
 # Allowed download qualities
 ALLOWED_QUALITIES = {"720p", "1080p", "best"}
 
-# Max concurrent jobs
-MAX_CONCURRENT_JOBS = 100
+# Allowed video file extensions
+ALLOWED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv")
+ALLOWED_VIDEO_SUFFIXES = {ext.lower() for ext in ALLOWED_VIDEO_EXTENSIONS}
 
 # Safe filename pattern: alphanumeric, hyphens, underscores, dots
 SAFE_FILENAME_PATTERN = re.compile(r'[^a-zA-Z0-9._-]')
 
 load_dotenv()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse boolean environment variables safely."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Parse positive integer environment variables safely."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return max(int(value), minimum)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r, using default=%d", name, value, default)
+        return default
+
+
+# Job and limiter capacity tuning
+MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 100)
+MAX_STORED_JOBS = _env_int("MAX_STORED_JOBS", 1000)
+RATE_LIMIT_MAX_KEYS = _env_int("RATE_LIMIT_MAX_KEYS", 10_000)
+TRUST_PROXY_HEADERS = _env_flag("TRUST_PROXY_HEADERS", False)
+
+# Statuses that count as active workload
+ACTIVE_JOB_STATUSES = {
+    "queued",
+    "downloading",
+    "extracting_audio",
+    "transcribing",
+    "translating",
+    "embedding_subtitles",
+    "reburning",
+}
 
 # Upload size limit (500 MB)
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
@@ -185,32 +225,73 @@ jobs_lock = threading.Lock()
 class RateLimiter:
     """Simple in-memory per-IP rate limiter."""
 
-    def __init__(self) -> None:
-        self._requests: dict[str, list[float]] = defaultdict(list)
+    def __init__(self, max_keys: int = RATE_LIMIT_MAX_KEYS) -> None:
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
+        self._max_keys = max_keys
+
+    def _prune_stale_keys(self, cutoff: float) -> None:
+        """Drop keys whose latest request is older than the cutoff."""
+        stale = [
+            key for key, timestamps in self._requests.items()
+            if not timestamps or timestamps[-1] <= cutoff
+        ]
+        for key in stale:
+            self._requests.pop(key, None)
 
     def check(self, key: str, max_requests: int, window_seconds: int = 60) -> bool:
         """Return True if request is allowed, False if rate limited."""
         now = time.time()
         cutoff = now - window_seconds
         with self._lock:
-            # Prune old entries
-            self._requests[key] = [t for t in self._requests[key] if t > cutoff]
-            if len(self._requests[key]) >= max_requests:
+            timestamps = self._requests.get(key)
+            if timestamps is None:
+                if len(self._requests) >= self._max_keys:
+                    self._prune_stale_keys(cutoff)
+                    if len(self._requests) >= self._max_keys:
+                        return False
+                timestamps = deque()
+                self._requests[key] = timestamps
+
+            while timestamps and timestamps[0] <= cutoff:
+                timestamps.popleft()
+
+            if len(timestamps) >= max_requests:
                 return False
-            self._requests[key].append(now)
+            timestamps.append(now)
             return True
 
 
 rate_limiter = RateLimiter()
 
 
+def _normalize_ip(value: str) -> Optional[str]:
+    """Return a normalized IP address string, or None if invalid."""
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except (ValueError, AttributeError):
+        return None
+
+
 def get_client_ip(request: Request) -> str:
-    """Extract client IP from request."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Extract client IP safely, with optional trusted proxy headers."""
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            for part in forwarded.split(","):
+                parsed = _normalize_ip(part)
+                if parsed:
+                    return parsed
+
+        real_ip = request.headers.get("X-Real-IP")
+        if real_ip:
+            parsed = _normalize_ip(real_ip)
+            if parsed:
+                return parsed
+
+    client_host = request.client.host if request.client else ""
+    parsed_client = _normalize_ip(client_host)
+    return parsed_client or "unknown"
 
 
 def check_rate_limit(request: Request, max_requests: int = 10) -> None:
@@ -259,18 +340,48 @@ def get_validated_job(job_id: str) -> dict:
     """FastAPI dependency: validate job_id and return the job dict, or raise 404."""
     if not validate_job_id(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
-    if job_id not in jobs:
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    return job
 
 
 # ============================================
 # Helpers
 # ============================================
 
+def count_active_jobs_locked() -> int:
+    """Count active jobs. Caller must hold jobs_lock."""
+    return sum(1 for job in jobs.values() if job.get("status") in ACTIVE_JOB_STATUSES)
+
+
+def enforce_capacity(require_active_slot: bool = False) -> None:
+    """Enforce stored-job and active-job capacity limits."""
+    cleanup_old_jobs()
+    with jobs_lock:
+        if len(jobs) >= MAX_STORED_JOBS:
+            raise HTTPException(status_code=429, detail="Server is full. Please try again later.")
+        if require_active_slot and count_active_jobs_locked() >= MAX_CONCURRENT_JOBS:
+            raise HTTPException(status_code=429, detail="Server is busy. Please try again later.")
+
+
+def _find_video_file_by_prefix(job_id: str, directories: list[Path]) -> Optional[str]:
+    """Fallback: find first matching video file by job_id prefix."""
+    for search_dir in directories:
+        try:
+            for file in search_dir.iterdir():
+                if file.name.startswith(job_id) and file.suffix.lower() in ALLOWED_VIDEO_SUFFIXES:
+                    return str(file)
+        except OSError:
+            continue
+    return None
+
+
 def find_video_path(job_id: str) -> Optional[str]:
     """Find video file path for a job. Prefers output (subtitled) video if available."""
-    job = jobs.get(job_id)
+    with jobs_lock:
+        job = jobs.get(job_id)
     if not job:
         logger.debug("Job %s not found in jobs dict", job_id)
         return None
@@ -289,12 +400,10 @@ def find_video_path(job_id: str) -> Optional[str]:
         return video_path
 
     # Fallback: search uploads and downloads directories
-    for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR]:
-        for ext in ['mp4', 'mov', 'avi', 'mkv']:
-            for file in search_dir.iterdir():
-                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
-                    logger.debug("Found via filesystem search: %s", file)
-                    return str(file)
+    fallback_path = _find_video_file_by_prefix(job_id, [UPLOAD_DIR, DOWNLOAD_DIR])
+    if fallback_path:
+        logger.debug("Found via filesystem search: %s", fallback_path)
+        return fallback_path
 
     logger.debug("No video found for job %s", job_id)
     return None
@@ -541,7 +650,8 @@ def process_video(
 
 def find_source_video_path(job_id: str) -> Optional[str]:
     """Find the original source video (upload/download/trimmed), NOT the subtitled output."""
-    job = jobs.get(job_id)
+    with jobs_lock:
+        job = jobs.get(job_id)
     if not job:
         return None
 
@@ -556,13 +666,7 @@ def find_source_video_path(job_id: str) -> Optional[str]:
         return video_path
 
     # Fallback: search uploads and downloads directories
-    for search_dir in [UPLOAD_DIR, DOWNLOAD_DIR]:
-        for ext in ['mp4', 'mov', 'avi', 'mkv']:
-            for file in search_dir.iterdir():
-                if file.name.startswith(job_id) and file.suffix.lower() == f'.{ext}':
-                    return str(file)
-
-    return None
+    return _find_video_file_by_prefix(job_id, [UPLOAD_DIR, DOWNLOAD_DIR])
 
 
 def reburn_video_task(job_id: str) -> None:
@@ -682,7 +786,7 @@ async def upload_video(
 ):
     """Upload video and start processing."""
     check_rate_limit(request, max_requests=10)
-    if not video.filename or not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+    if not video.filename or not video.filename.lower().endswith(ALLOWED_VIDEO_EXTENSIONS):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file.")
 
     language = validate_language(language)
@@ -691,9 +795,7 @@ async def upload_video(
     if use_ollama:
         ollama_model = validate_ollama_model(ollama_model)
 
-    with jobs_lock:
-        if len(jobs) >= MAX_CONCURRENT_JOBS:
-            raise HTTPException(status_code=429, detail="Server is busy. Please try again later.")
+    enforce_capacity(require_active_slot=True)
 
     job_id = str(uuid.uuid4())
     safe_name = sanitize_filename(video.filename)
@@ -723,12 +825,10 @@ async def upload_video(
 async def upload_video_only(request: Request, video: UploadFile = File(...)):
     """Upload video without starting processing (for wizard flow)."""
     check_rate_limit(request, max_requests=10)
-    if not video.filename or not video.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+    if not video.filename or not video.filename.lower().endswith(ALLOWED_VIDEO_EXTENSIONS):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file.")
 
-    with jobs_lock:
-        if len(jobs) >= MAX_CONCURRENT_JOBS:
-            raise HTTPException(status_code=429, detail="Server is busy. Please try again later.")
+    enforce_capacity(require_active_slot=False)
 
     job_id = str(uuid.uuid4())
     safe_name = sanitize_filename(video.filename)
@@ -772,6 +872,7 @@ async def process_existing_video(
 ):
     """Start translation processing on an already downloaded/uploaded video."""
     check_rate_limit(http_request, max_requests=10)
+    enforce_capacity(require_active_slot=True)
     language = validate_language(request.language)
     translation_service = validate_translation_service(request.translation_service)
     use_ollama = translation_service.lower() == "ollama"
@@ -783,6 +884,8 @@ async def process_existing_video(
         raise HTTPException(status_code=404, detail="Video file not found. Upload or download a video first.")
 
     with jobs_lock:
+        if job.get("status") in ACTIVE_JOB_STATUSES:
+            raise HTTPException(status_code=409, detail="Job is already running")
         job["status"] = "queued"
         job["progress"] = 0
         job["output_file"] = None
@@ -946,9 +1049,7 @@ async def download_from_url(http_request: Request, background_tasks: BackgroundT
     if not is_valid_url(url):
         raise HTTPException(status_code=400, detail="Invalid URL. Please provide a YouTube or X/Twitter video link.")
 
-    with jobs_lock:
-        if len(jobs) >= MAX_CONCURRENT_JOBS:
-            raise HTTPException(status_code=429, detail="Server is busy. Please try again later.")
+    enforce_capacity(require_active_slot=True)
 
     try:
         info = get_video_info(url)
@@ -1198,12 +1299,20 @@ async def update_subtitles(job_id: str, request: SubtitlesUpdateRequest, job: di
 async def reburn_video(job_id: str, request: Request, background_tasks: BackgroundTasks, job: dict = Depends(get_validated_job)):
     """Re-embed edited subtitles into video."""
     check_rate_limit(request, max_requests=10)
+    enforce_capacity(require_active_slot=True)
     if job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Job must be completed before re-burning")
 
     subtitles = job.get("subtitles", [])
     if not subtitles:
         raise HTTPException(status_code=400, detail="No subtitles to burn")
+
+    with jobs_lock:
+        if job.get("status") in ACTIVE_JOB_STATUSES:
+            raise HTTPException(status_code=409, detail="Job is already running")
+        # Reserve a slot immediately to prevent duplicate reburn requests
+        job["status"] = "queued"
+        job["progress"] = 0
 
     background_tasks.add_task(reburn_video_task, job_id)
 

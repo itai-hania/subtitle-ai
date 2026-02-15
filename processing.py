@@ -24,6 +24,23 @@ FFMPEG_PROBE_TIMEOUT = 10      # 10 sec for ffprobe
 # Whisper API file size limit
 WHISPER_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
 
+# Translation logging controls (off by default to avoid PII/disk leakage)
+ENABLE_TRANSLATION_DEBUG_LOGS = os.getenv("ENABLE_TRANSLATION_DEBUG_LOGS", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+try:
+    TRANSLATION_LOG_PREVIEW_CHARS = max(20, int(os.getenv("TRANSLATION_LOG_PREVIEW_CHARS", "120")))
+except ValueError:
+    TRANSLATION_LOG_PREVIEW_CHARS = 120
+
+
+def _preview_text(text: str, max_chars: int = TRANSLATION_LOG_PREVIEW_CHARS) -> str:
+    """Compact text for safe debug logging."""
+    normalized = " ".join((text or "").split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[:max_chars] + "..."
+
 
 def escape_ffmpeg_filter_text(text: str) -> str:
     """Escape special characters for FFmpeg filter expressions.
@@ -189,6 +206,7 @@ def batch_translate_openai(
     texts: list[str],
     target_language: str,
     chunk_num: int = 0,
+    include_debug_log: bool = False,
 ) -> tuple[list[str], dict, str]:
     """Translate a batch of texts using OpenAI GPT in a single API call.
     Returns (translations, token_usage, log_entry) tuple."""
@@ -243,7 +261,9 @@ Example format:
 
     translations = parse_numbered_translations(result_text, texts)
 
-    # Build log entry string (written to disk by caller)
+    if not include_debug_log:
+        return translations, token_usage, ""
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     log_lines: list[str] = [
         f"=== CHUNK {chunk_num} ===",
@@ -252,16 +272,11 @@ Example format:
         f"Number of segments: {len(texts)}",
         f"Input tokens: {token_usage['prompt_tokens']}",
         f"Output tokens: {token_usage['completion_tokens']}",
-        f"\n{'='*50}\nINPUT TEXT:\n{'='*50}",
-        numbered_text,
-        f"\n{'='*50}\nOUTPUT TEXT:\n{'='*50}",
-        result_text,
-        f"\n{'='*50}",
-        f"\nSEGMENT MAPPING:\n{'='*50}",
+        "Segment preview mapping:",
     ]
     for i, (orig, trans) in enumerate(zip(texts, translations), 1):
-        log_lines.append(f"[{i}] ORIG: {orig[:50]}...")
-        log_lines.append(f"[{i}] TRANS: {trans[:50]}...")
+        log_lines.append(f"[{i}] ORIG: {_preview_text(orig)}")
+        log_lines.append(f"[{i}] TRANS: {_preview_text(trans)}")
         log_lines.append("-" * 30)
 
     return translations, token_usage, "\n".join(log_lines)
@@ -461,7 +476,11 @@ def generate_srt(
             else:
                 chunk_num = chunk_start // chunk_size + 1
                 chunk_translations, chunk_tokens, log_entry = batch_translate_openai(
-                    client, chunk, target_language, chunk_num
+                    client,
+                    chunk,
+                    target_language,
+                    chunk_num,
+                    include_debug_log=ENABLE_TRANSLATION_DEBUG_LOGS,
                 )
                 total_tokens["prompt_tokens"] += chunk_tokens["prompt_tokens"]
                 total_tokens["completion_tokens"] += chunk_tokens["completion_tokens"]

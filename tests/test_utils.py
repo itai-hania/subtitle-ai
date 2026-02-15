@@ -1,7 +1,10 @@
 """Unit tests for pure utility functions (Issue 9A)."""
 
+from types import SimpleNamespace
+
 import pytest
 
+import app as app_module
 from processing import (
     format_timestamp,
     parse_ffmpeg_error,
@@ -94,6 +97,36 @@ class TestValidateJobId:
 
     def test_single_char(self):
         assert validate_job_id("a") is False
+
+
+# ============================================
+# client IP extraction / rate limiting safety
+# ============================================
+
+class _FakeRequest:
+    def __init__(self, headers: dict[str, str], client_host: str):
+        self.headers = headers
+        self.client = SimpleNamespace(host=client_host)
+
+
+class TestClientIpExtraction:
+    def test_ignores_x_forwarded_for_when_proxy_not_trusted(self, monkeypatch):
+        monkeypatch.setattr(app_module, "TRUST_PROXY_HEADERS", False)
+        request = _FakeRequest({"X-Forwarded-For": "203.0.113.10"}, "198.51.100.7")
+        assert app_module.get_client_ip(request) == "198.51.100.7"
+
+    def test_uses_valid_forwarded_ip_when_proxy_is_trusted(self, monkeypatch):
+        monkeypatch.setattr(app_module, "TRUST_PROXY_HEADERS", True)
+        request = _FakeRequest({"X-Forwarded-For": "garbage, 203.0.113.10"}, "198.51.100.7")
+        assert app_module.get_client_ip(request) == "203.0.113.10"
+
+
+class TestRateLimiterCapacity:
+    def test_blocks_new_keys_when_max_keys_reached(self):
+        limiter = app_module.RateLimiter(max_keys=2)
+        assert limiter.check("203.0.113.1", max_requests=5) is True
+        assert limiter.check("203.0.113.2", max_requests=5) is True
+        assert limiter.check("203.0.113.3", max_requests=5) is False
 
 
 # ============================================

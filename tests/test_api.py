@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime
+import uuid
 
 from app import jobs, jobs_lock
 
@@ -75,6 +76,23 @@ class TestUploadValidation:
         data = response.json()
         assert "job_id" in data
 
+    def test_upload_only_allows_when_many_completed_jobs_exist(self, client):
+        import io
+        with jobs_lock:
+            for _ in range(150):
+                jobs[str(uuid.uuid4())] = {
+                    "status": "completed",
+                    "created_at": datetime.now(),
+                    "files": [],
+                }
+
+        file = io.BytesIO(b"\x00" * 100)
+        response = client.post(
+            "/upload-only",
+            files={"video": ("new.mp4", file, "video/mp4")},
+        )
+        assert response.status_code == 200
+
 
 # ============================================
 # Download endpoints — wrong state
@@ -131,6 +149,29 @@ class TestDownloadValidation:
         response = client.get(f"/download-transcription/{NOTR_UUID}")
         assert response.status_code == 404
         assert "not available" in response.json()["detail"].lower()
+
+
+class TestProcessValidation:
+    def test_process_active_job_returns_409(self, client, tmp_path):
+        job_id = "55555555-5555-5555-5555-555555555555"
+        video_path = tmp_path / "active.mp4"
+        video_path.write_bytes(b"\x00" * 10)
+
+        jobs[job_id] = {
+            "status": "transcribing",
+            "progress": 30,
+            "video_path": str(video_path),
+            "original_filename": "active.mp4",
+            "created_at": datetime.now(),
+            "files": [str(video_path)],
+        }
+
+        response = client.post(
+            f"/process/{job_id}",
+            json={"language": "English", "translation_service": "openai", "ollama_model": "llama3.2"},
+        )
+        assert response.status_code == 409
+        assert "already running" in response.json()["detail"].lower()
 
 
 # ============================================
